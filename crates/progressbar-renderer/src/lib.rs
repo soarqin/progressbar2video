@@ -51,7 +51,7 @@ pub fn render_frame(
     for segment in &layout.segments {
         fill_rect(&mut pixmap, segment.rect, &config.bar.fill_color)?;
         let divider = progressbar_core::Rect {
-            x: segment.rect.x,
+            x: segment.rect.x.round(),
             y: segment.rect.y,
             width: 1.0,
             height: segment.rect.height,
@@ -322,6 +322,20 @@ mod tests {
         let bar_y = 180 - 20 - 30;
         let sample = frame.pixel_rgba(160, bar_y + 15);
         assert!(sample[3] > 0);
+    }
+
+    #[test]
+    fn renders_fractional_duration_dividers_without_panic() {
+        let mut config = ProjectConfig::default();
+        config.render.width = 640;
+        config.render.height = 360;
+        config.bar.margin_x = 40;
+        config.bar.margin_bottom = 24;
+        config.bar.height = 48;
+        config.playback_progress.height = 5;
+        let timeline = Timeline::parse("2 | A\n4 | B\n6 | C").unwrap();
+        let frame = render_frame(&config, &timeline, 1_000).unwrap();
+        assert_eq!(frame.width, 640);
     }
 
     #[test]
