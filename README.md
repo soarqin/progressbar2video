@@ -24,6 +24,31 @@ Render a PNG sequence:
 cargo run -p progressbar-cli -- render --config examples/basic/config.toml --segments examples/basic/segments.txt
 ```
 
+Output profiles:
+
+- `png-sequence`: directory of transparent PNG frames.
+- `apng`: single transparent animated PNG, best for short overlays.
+- `ffv1-mkv`: FFmpeg-backed mathematically lossless alpha video.
+- `prores4444-mov`: FFmpeg-backed editing intermediate with alpha.
+
+Render APNG:
+
+```powershell
+cargo run -p progressbar-cli -- render --config examples/encoder-profiles/apng.toml --segments examples/encoder-profiles/segments.txt
+```
+
+Render FFV1 MKV:
+
+```powershell
+cargo run -p progressbar-cli -- render --config examples/encoder-profiles/ffv1.toml --segments examples/encoder-profiles/segments.txt
+```
+
+Render ProRes 4444 MOV:
+
+```powershell
+cargo run -p progressbar-cli -- render --config examples/encoder-profiles/prores4444.toml --segments examples/encoder-profiles/segments.txt
+```
+
 Preview long text overflow handling:
 
 ```powershell

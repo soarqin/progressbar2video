@@ -109,10 +109,10 @@ where
     F: FnMut(RenderProgress),
 {
     let total_frames = frame_count(timeline.duration_ms(), config.render.fps);
-    let total_frames_u32 = u32::try_from(total_frames)
-        .map_err(|_| EncodeError::TooManyApngFrames { total_frames })?;
-    let delay_den = u16::try_from(config.render.fps)
-        .map_err(|_| EncodeError::UnsupportedApngFps {
+    let total_frames_u32 =
+        u32::try_from(total_frames).map_err(|_| EncodeError::TooManyApngFrames { total_frames })?;
+    let delay_den =
+        u16::try_from(config.render.fps).map_err(|_| EncodeError::UnsupportedApngFps {
             fps: config.render.fps,
         })?;
 

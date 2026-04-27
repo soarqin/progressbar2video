@@ -1,0 +1,37 @@
+[render]
+width = 640
+height = 360
+fps = 10
+background = "transparent"
+
+[bar]
+position = "bottom"
+height = 56
+margin_x = 48
+margin_bottom = 28
+corner_radius = 6
+track_color = "#FFFFFF33"
+fill_color = "#4DA3FF"
+divider_color = "#FFFFFFAA"
+
+[playback_progress]
+enabled = true
+height = 5
+offset_y = 0
+color = "#FFFFFF"
+track_color = "#00000033"
+thumb_enabled = true
+thumb_radius = 6
+thumb_color = "#FFFFFF"
+
+[text]
+font_family = "Microsoft YaHei"
+font_size = 24
+min_font_size = 14
+color = "#FFFFFF"
+display_mode = "all-segments"
+overflow = "auto"
+
+[output]
+format = "prores4444-mov"
+path = "examples/encoder-profiles/out/progress.mov"
