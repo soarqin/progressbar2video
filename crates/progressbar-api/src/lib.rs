@@ -13,6 +13,12 @@ pub struct PreviewFrameRequest {
     pub timestamp_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct RenderOverlayRequest {
+    pub config_path: PathBuf,
+    pub segments_path: PathBuf,
+}
+
 #[derive(Debug, Error)]
 pub enum ApiError {
     #[error("failed to read `{path}`: {source}")]
@@ -53,6 +59,15 @@ pub fn preview_frame(request: PreviewFrameRequest) -> Result<(), ApiError> {
         source,
     })?;
     write_png(&frame, file).map_err(|error| ApiError::Render(error.to_string()))
+}
+
+pub fn render_overlay<F>(request: RenderOverlayRequest, on_progress: F) -> Result<(), ApiError>
+where
+    F: FnMut(progressbar_encoder::RenderProgress),
+{
+    let (config, timeline) = load_project(request.config_path, request.segments_path)?;
+    progressbar_encoder::render_png_sequence(&config, &timeline, on_progress)
+        .map_err(|error| ApiError::Render(error.to_string()))
 }
 
 fn load_project(
