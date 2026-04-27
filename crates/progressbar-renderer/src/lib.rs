@@ -371,34 +371,30 @@ fn draw_text_pixels(
     let rotated_y = rect.y + 4.0;
 
     let mut borrowed = buffer.borrow_with(font_system);
-    borrowed.draw(
-        swash_cache,
-        text_color,
-        |x, y, width, height, color| {
-            let [r, g, b, a] = color.as_rgba();
-            for dy in 0..height as i32 {
-                for dx in 0..width as i32 {
-                    let (px, py) = match plan.mode {
-                        LabelRenderMode::Normal | LabelRenderMode::Scroll { .. } => (
-                            base_x.round() as i32 + x + dx,
-                            baseline_y.round() as i32 + y + dy,
-                        ),
-                        LabelRenderMode::Rotate => {
-                            let source_x = (x + dx) as f32;
-                            let source_y = (y + dy) as f32 + font_size;
-                            (
-                                (rotated_x + line_height - source_y).round() as i32,
-                                (rotated_y + source_x).round() as i32,
-                            )
-                        }
-                    };
-                    if px >= clip_left && px < clip_right && py >= clip_top && py < clip_bottom {
-                        blend_pixel(pixmap, px as u32, py as u32, [r, g, b, a]);
+    borrowed.draw(swash_cache, text_color, |x, y, width, height, color| {
+        let [r, g, b, a] = color.as_rgba();
+        for dy in 0..height as i32 {
+            for dx in 0..width as i32 {
+                let (px, py) = match plan.mode {
+                    LabelRenderMode::Normal | LabelRenderMode::Scroll { .. } => (
+                        base_x.round() as i32 + x + dx,
+                        baseline_y.round() as i32 + y + dy,
+                    ),
+                    LabelRenderMode::Rotate => {
+                        let source_x = (x + dx) as f32;
+                        let source_y = (y + dy) as f32 + font_size;
+                        (
+                            (rotated_x + line_height - source_y).round() as i32,
+                            (rotated_y + source_x).round() as i32,
+                        )
                     }
+                };
+                if px >= clip_left && px < clip_right && py >= clip_top && py < clip_bottom {
+                    blend_pixel(pixmap, px as u32, py as u32, [r, g, b, a]);
                 }
             }
-        },
-    );
+        }
+    });
 
     Ok(())
 }
