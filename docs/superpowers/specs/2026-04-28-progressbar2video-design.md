@@ -13,7 +13,7 @@ The project will support these core workflows:
 - Read segment definitions from a plain text file.
 - Read render, style, text, and output settings from a structured config file.
 - Preview a representative frame or short preview range.
-- Render a complete transparent progress-bar overlay.
+- Render a complete transparent progress-bar overlay whose duration matches the last segment end time.
 - Export lossless or near-editing-master outputs for downstream video editing.
 
 The first implementation should avoid a large GUI runtime. It should also avoid making the command line the internal integration boundary. CLI support is useful for batch jobs, but GUI and CLI must call the same core API.
@@ -64,6 +64,7 @@ Responsibilities:
 - Merge user config with defaults.
 - Validate invalid combinations before rendering starts.
 - Export JSON Schema for the web UI so forms and core validation stay aligned.
+- Require a resolved `min_font_size` whenever automatic text overflow may fall back to scrolling.
 
 ### `progressbar-core`
 
@@ -74,8 +75,9 @@ Responsibilities:
 - Parse segment text files.
 - Normalize times into milliseconds or frame-accurate rational timestamps.
 - Convert segment end points into `[start, end, label]` ranges.
+- Treat the final segment end time as the full overlay duration.
 - Compute progress state for any timestamp.
-- Compute bar and label layout rectangles.
+- Compute duration-proportional bar and label layout rectangles.
 - Select text overflow behavior for each segment.
 
 ### `progressbar-renderer`
@@ -85,7 +87,8 @@ Owns drawing transparent RGBA frames.
 Responsibilities:
 
 - Render one frame from resolved config plus timeline state.
-- Draw progress track, filled progress, segment dividers, labels, and optional active segment styling.
+- Draw the segmented bar track, segment fills, dividers, labels, and optional active segment styling.
+- Draw an optional playback-progress overlay above the segmented progress bar and below text.
 - Respect transparent canvas defaults.
 - Clip text to segment bounds to prevent overlap.
 - Support long-text strategies: shrink, ellipsis, rotate, scroll, and auto.
@@ -187,15 +190,24 @@ corner_radius = 8
 track_color = "#FFFFFF33"
 fill_color = "#4DA3FF"
 divider_color = "#FFFFFFAA"
-divider_mode = "segment-boundaries"
+
+[playback_progress]
+enabled = true
+height = 6
+offset_y = 0
+color = "#FFFFFF"
+track_color = "#00000033"
+thumb_enabled = true
+thumb_radius = 7
+thumb_color = "#FFFFFF"
 
 [text]
 font_family = "Microsoft YaHei"
 font_size = 28
+min_font_size = 18
 color = "#FFFFFF"
-mode = "all-segments"
+display_mode = "all-segments"
 overflow = "auto"
-scroll_speed_px_per_sec = 80
 
 [output]
 format = "png-sequence"
@@ -208,33 +220,49 @@ Defaults live in `progressbar-schema`; renderer code should receive resolved val
 
 The renderer produces frames at a configured width, height, and fps.
 
+The overlay duration is derived from the last segment end time. There is no separate duration setting in the first version. If the final segment ends at `00:03:20.000`, rendering at 60 fps produces a 200-second overlay with 12,000 frames.
+
 Default composition:
 
 - Full frame is transparent RGBA.
 - Progress bar sits near the bottom edge.
 - Track spans the configured horizontal margins.
-- Fill grows with total timeline progress.
-- Segment dividers mark configured segment boundaries.
+- Segment fill is drawn as a duration-proportional static band according to bar styling.
+- Segment widths and divider positions are always proportional to segment duration.
+- Segment dividers mark duration-based segment boundaries.
+- Optional playback-progress overlay shows the current timestamp above the segmented progress bar.
 - Text is drawn inside each segment area or according to the selected text display mode.
 
-Text display modes:
+Render order:
+
+- Transparent frame background.
+- Segmented progress bar track, fills, and dividers.
+- Optional playback-progress overlay.
+- Text labels and label-specific effects.
+
+Text display modes are configured through `text.display_mode`:
 
 - `all-segments`: show labels for all segments.
 - `active-only`: show only the current segment label.
 - `past-current`: show labels up to the current segment.
 - `none`: render only the visual bar and dividers.
 
-Divider modes:
+Segment splitting is fixed to duration-proportional layout. There is no segment split mode setting in the first version. Equal-width splitting is intentionally out of scope because the overlay should match the source video's real time.
 
-- `segment-boundaries`: draw dividers at every boundary.
-- `equal-width`: visually divide all segments equally regardless of duration.
-- `none`: no dividers.
+### Playback Progress Overlay
 
-Progress fill modes:
+The optional playback-progress overlay behaves like the progress indicator commonly seen in video players. It shows the current timestamp's absolute position within the full overlay duration.
 
-- `continuous`: fill by total elapsed time.
-- `segment-step`: fill completed segments and optionally the active segment.
-- `active-segment`: emphasize only the current segment while keeping global track visible.
+Configuration controls:
+
+- `enabled`: turn the overlay on or off.
+- `height`: progress overlay thickness.
+- `offset_y`: vertical offset relative to the segmented progress bar centerline.
+- `color`: elapsed progress color.
+- `track_color`: optional remaining-track color.
+- `thumb_enabled`, `thumb_radius`, and `thumb_color`: optional current-time handle.
+
+This overlay is visual-only. It does not change segment boundaries, segment labels, or output duration.
 
 ## Long Text Handling
 
@@ -245,10 +273,10 @@ Overflow strategies:
 - `shrink`: reduce font size down to a configured minimum.
 - `ellipsis`: truncate with an ellipsis.
 - `rotate`: rotate text 90 degrees when the segment is narrow but bar height can fit the vertical label.
-- `scroll`: horizontally scroll text inside its clipped region.
-- `auto`: choose a strategy in this order: normal, shrink, ellipsis for mildly long labels, rotate for narrow tall-enough cells, scroll for labels that still cannot fit.
+- `scroll`: horizontally scroll text inside its clipped region over the segment's own time range.
+- `auto`: choose a strategy in this order: normal, shrink down to `min_font_size`, ellipsis for mildly long labels, rotate for narrow tall-enough cells, scroll for labels that still cannot fit.
 
-Scrolling must be deterministic from timestamp so previewing and rendering the same time produces the same frame.
+When `overflow = "auto"`, scrolling is only allowed after the font reaches `min_font_size`. The resolved configuration must include `min_font_size`; otherwise validation fails before rendering. There is no `scroll_speed_px_per_sec` setting. Scroll offset is derived from the current timestamp, segment start time, segment end time, measured text width, and label rectangle width so previewing and rendering the same time produces the same frame.
 
 ## Output Formats
 
@@ -289,7 +317,9 @@ GUI should display concise messages and optional details. CLI should print the s
 Unit tests:
 
 - Segment parsing and time normalization.
+- Overlay duration derived from the final segment end time.
 - Config default merging and validation.
+- `overflow = "auto"` validation requires a resolved `min_font_size` before scroll fallback can be selected.
 - Layout calculations for different segment densities.
 - Text overflow strategy selection.
 
@@ -297,11 +327,13 @@ Snapshot or image tests:
 
 - Render a deterministic preview frame and compare dimensions, alpha, and selected pixel regions.
 - Verify transparent background pixels remain transparent.
+- Verify playback-progress overlay pixels appear above the segmented bar and below text.
 - Verify labels stay clipped within their segment rectangles.
 
 Integration tests:
 
 - Render a tiny 2-second PNG sequence.
+- Verify rendered frame count matches `final_segment_end_time * fps`.
 - Render a tiny APNG after the encoder milestone adds APNG support.
 - Validate FFmpeg command construction without requiring a full long render.
 
@@ -311,19 +343,22 @@ Manual QA:
 - Long Chinese labels.
 - Many short segments.
 - Mixed Latin and Chinese labels.
+- Playback-progress overlay enabled and disabled.
 - Very small and very large bar heights.
 
 ## Milestones
 
-### Milestone 1: Core Spec and Preview Frame
+### Milestone 1: Core Spec, Playback Overlay, and Preview Frame
 
-Build schema, segment parser, layout engine, and one-frame transparent PNG preview.
+Build schema, segment parser, duration-proportional layout engine, optional playback-progress overlay, and one-frame transparent PNG preview.
 
 Success criteria:
 
 - A config and segment file can produce a transparent PNG preview.
 - Default values are centralized.
 - Invalid segment files produce line-specific errors.
+- Segment widths are proportional to duration.
+- Playback-progress overlay renders at the correct timestamp layer when enabled.
 
 ### Milestone 2: Full PNG Sequence Rendering
 
@@ -332,6 +367,7 @@ Render all frames as a PNG sequence without loading all frames into memory.
 Success criteria:
 
 - Progress events report frame count and percentage.
+- Total frame count is derived from the final segment end time and fps.
 - Output frames preserve alpha.
 - Long videos stream frame-by-frame.
 
@@ -343,7 +379,8 @@ Success criteria:
 
 - Labels do not overlap neighboring segments.
 - Labels do not overflow the frame.
-- Scroll position is deterministic by timestamp.
+- Auto overflow can only fall back to scrolling after shrinking to `min_font_size`.
+- Scroll position is deterministic by timestamp and segment duration.
 
 ### Milestone 4: Encoder Profiles
 
