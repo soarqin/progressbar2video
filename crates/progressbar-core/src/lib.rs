@@ -218,6 +218,89 @@ pub fn frame_timestamp_ms(frame_index: u64, fps: u32) -> TimeMs {
     ((frame_index as u128 * 1000) / fps as u128) as TimeMs
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextStrategyInput {
+    pub overflow: progressbar_schema::OverflowMode,
+    pub text_width_px: f32,
+    pub rect_width_px: f32,
+    pub font_size: u32,
+    pub min_font_size: u32,
+    pub can_rotate: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextStrategyDecision {
+    Normal { font_size: u32 },
+    Shrink { font_size: u32 },
+    Ellipsis { font_size: u32 },
+    Rotate { font_size: u32 },
+    Scroll { font_size: u32 },
+}
+
+pub fn choose_text_strategy(input: TextStrategyInput) -> TextStrategyDecision {
+    use progressbar_schema::OverflowMode;
+
+    if input.text_width_px <= input.rect_width_px {
+        return TextStrategyDecision::Normal {
+            font_size: input.font_size,
+        };
+    }
+
+    match input.overflow {
+        OverflowMode::Shrink => TextStrategyDecision::Shrink {
+            font_size: input.min_font_size,
+        },
+        OverflowMode::Ellipsis => TextStrategyDecision::Ellipsis {
+            font_size: input.font_size,
+        },
+        OverflowMode::Rotate => TextStrategyDecision::Rotate {
+            font_size: input.font_size,
+        },
+        OverflowMode::Scroll => TextStrategyDecision::Scroll {
+            font_size: input.font_size,
+        },
+        OverflowMode::Auto => {
+            let shrink_ratio = input.rect_width_px / input.text_width_px;
+            let shrunk_size = ((input.font_size as f32 * shrink_ratio).floor() as u32)
+                .clamp(input.min_font_size, input.font_size);
+            if shrunk_size > input.min_font_size {
+                return TextStrategyDecision::Shrink {
+                    font_size: shrunk_size,
+                };
+            }
+            if input.text_width_px <= input.rect_width_px * 1.8 {
+                return TextStrategyDecision::Ellipsis {
+                    font_size: input.min_font_size,
+                };
+            }
+            if input.can_rotate {
+                return TextStrategyDecision::Rotate {
+                    font_size: input.min_font_size,
+                };
+            }
+            TextStrategyDecision::Scroll {
+                font_size: input.min_font_size,
+            }
+        }
+    }
+}
+
+pub fn scroll_offset_px(
+    timestamp_ms: TimeMs,
+    segment: &Segment,
+    text_width_px: f32,
+    rect_width_px: f32,
+) -> f32 {
+    if text_width_px <= rect_width_px || segment.end_ms <= segment.start_ms {
+        return 0.0;
+    }
+    let elapsed = timestamp_ms
+        .saturating_sub(segment.start_ms)
+        .min(segment.end_ms - segment.start_ms);
+    let ratio = elapsed as f32 / (segment.end_ms - segment.start_ms) as f32;
+    -(text_width_px - rect_width_px) * ratio
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +365,44 @@ mod tests {
         let timeline = Timeline::parse("2 | A").unwrap();
         assert_eq!(frame_count(timeline.duration_ms(), 60), 120);
         assert_eq!(frame_count(2_001, 60), 121);
+    }
+
+    #[test]
+    fn auto_uses_scroll_only_after_min_font_size() {
+        let decision = choose_text_strategy(TextStrategyInput {
+            overflow: progressbar_schema::OverflowMode::Auto,
+            text_width_px: 500.0,
+            rect_width_px: 100.0,
+            font_size: 28,
+            min_font_size: 18,
+            can_rotate: false,
+        });
+        assert_eq!(decision, TextStrategyDecision::Scroll { font_size: 18 });
+    }
+
+    #[test]
+    fn auto_prefers_rotation_for_narrow_cells_when_allowed() {
+        let decision = choose_text_strategy(TextStrategyInput {
+            overflow: progressbar_schema::OverflowMode::Auto,
+            text_width_px: 300.0,
+            rect_width_px: 80.0,
+            font_size: 28,
+            min_font_size: 18,
+            can_rotate: true,
+        });
+        assert_eq!(decision, TextStrategyDecision::Rotate { font_size: 18 });
+    }
+
+    #[test]
+    fn explicit_scroll_uses_configured_font_size() {
+        let decision = choose_text_strategy(TextStrategyInput {
+            overflow: progressbar_schema::OverflowMode::Scroll,
+            text_width_px: 300.0,
+            rect_width_px: 80.0,
+            font_size: 28,
+            min_font_size: 18,
+            can_rotate: true,
+        });
+        assert_eq!(decision, TextStrategyDecision::Scroll { font_size: 28 });
     }
 }
