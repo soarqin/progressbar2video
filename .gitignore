@@ -1,8 +1,20 @@
-/.worktrees/
+# Rust
 /target/
-/.idea/
-/.vscode/
 *.pdb
-*.log
+
+# Generated output
+/.worktrees/
 /out/
 /examples/**/out/
+
+# Editors
+/.idea/
+/.vscode/
+
+# Logs and local temp files
+*.log
+*.tmp
+
+# OS metadata
+.DS_Store
+Thumbs.db
