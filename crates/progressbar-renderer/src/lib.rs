@@ -212,6 +212,111 @@ fn draw_label_text(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct LabelRenderPlan {
+    text: String,
+    font_size: u32,
+    mode: LabelRenderMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LabelRenderMode {
+    Normal,
+    Rotate,
+    Scroll { offset_px: f32 },
+}
+
+fn estimate_text_width(text: &str, font_size: u32) -> f32 {
+    text.chars()
+        .map(|ch| if ch.is_ascii() { 0.58 } else { 1.0 })
+        .sum::<f32>()
+        * font_size as f32
+}
+
+fn can_rotate_label(rect: progressbar_core::Rect, min_font_size: u32) -> bool {
+    rect.height >= min_font_size as f32 * 2.5
+}
+
+fn plan_label_render(
+    config: &ProjectConfig,
+    rect: progressbar_core::Rect,
+    label: &str,
+    timestamp_ms: TimeMs,
+    segment_start_ms: TimeMs,
+    segment_end_ms: TimeMs,
+) -> LabelRenderPlan {
+    let text_width = estimate_text_width(label, config.text.font_size);
+    let decision = progressbar_core::choose_text_strategy(progressbar_core::TextStrategyInput {
+        overflow: config.text.overflow.clone(),
+        text_width_px: text_width,
+        rect_width_px: rect.width.max(1.0),
+        font_size: config.text.font_size,
+        min_font_size: config.text.min_font_size,
+        can_rotate: can_rotate_label(rect, config.text.min_font_size),
+    });
+
+    match decision {
+        progressbar_core::TextStrategyDecision::Normal { font_size }
+        | progressbar_core::TextStrategyDecision::Shrink { font_size } => LabelRenderPlan {
+            text: label.to_string(),
+            font_size,
+            mode: LabelRenderMode::Normal,
+        },
+        progressbar_core::TextStrategyDecision::Ellipsis { font_size } => LabelRenderPlan {
+            text: ellipsize_to_width(label, font_size, rect.width.max(1.0)),
+            font_size,
+            mode: LabelRenderMode::Normal,
+        },
+        progressbar_core::TextStrategyDecision::Rotate { font_size } => LabelRenderPlan {
+            text: label.to_string(),
+            font_size,
+            mode: LabelRenderMode::Rotate,
+        },
+        progressbar_core::TextStrategyDecision::Scroll { font_size } => {
+            let segment = progressbar_core::Segment {
+                start_ms: segment_start_ms,
+                end_ms: segment_end_ms,
+                label: label.to_string(),
+            };
+            let measured = estimate_text_width(label, font_size);
+            LabelRenderPlan {
+                text: label.to_string(),
+                font_size,
+                mode: LabelRenderMode::Scroll {
+                    offset_px: progressbar_core::scroll_offset_px(
+                        timestamp_ms,
+                        &segment,
+                        measured,
+                        rect.width,
+                    ),
+                },
+            }
+        }
+    }
+}
+
+fn ellipsize_to_width(label: &str, font_size: u32, max_width: f32) -> String {
+    if estimate_text_width(label, font_size) <= max_width {
+        return label.to_string();
+    }
+
+    let ellipsis = "...";
+    let mut output = String::new();
+    for ch in label.chars() {
+        let candidate = format!("{output}{ch}{ellipsis}");
+        if estimate_text_width(&candidate, font_size) > max_width {
+            break;
+        }
+        output.push(ch);
+    }
+
+    if output.is_empty() {
+        ellipsis.to_string()
+    } else {
+        format!("{output}{ellipsis}")
+    }
+}
+
 fn fill_rect(
     pixmap: &mut Pixmap,
     rect: progressbar_core::Rect,
@@ -336,6 +441,58 @@ mod tests {
         let timeline = Timeline::parse("2 | A\n4 | B\n6 | C").unwrap();
         let frame = render_frame(&config, &timeline, 1_000).unwrap();
         assert_eq!(frame.width, 640);
+    }
+
+    #[test]
+    fn ellipsis_plan_shortens_text_to_fit_rect() {
+        let mut config = ProjectConfig::default();
+        config.text.overflow = progressbar_schema::OverflowMode::Ellipsis;
+        config.text.font_size = 24;
+        config.text.min_font_size = 14;
+        let rect = progressbar_core::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 80.0,
+            height: 40.0,
+        };
+        let plan = plan_label_render(&config, rect, "这是一个非常非常长的标题", 0, 0, 2_000);
+        assert!(matches!(plan.mode, LabelRenderMode::Normal));
+        assert!(plan.text.ends_with("..."));
+        assert!(estimate_text_width(&plan.text, plan.font_size) <= rect.width);
+    }
+
+    #[test]
+    fn auto_scroll_plan_uses_min_font_size_when_rotation_is_not_available() {
+        let mut config = ProjectConfig::default();
+        config.text.overflow = progressbar_schema::OverflowMode::Auto;
+        config.text.font_size = 28;
+        config.text.min_font_size = 16;
+        let rect = progressbar_core::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 70.0,
+            height: 12.0,
+        };
+        let plan = plan_label_render(&config, rect, "这是一个非常非常长的标题", 1_000, 0, 2_000);
+        assert_eq!(plan.font_size, 16);
+        assert!(matches!(plan.mode, LabelRenderMode::Scroll { .. }));
+    }
+
+    #[test]
+    fn auto_rotate_plan_uses_min_font_size_for_narrow_tall_cells() {
+        let mut config = ProjectConfig::default();
+        config.text.overflow = progressbar_schema::OverflowMode::Auto;
+        config.text.font_size = 28;
+        config.text.min_font_size = 16;
+        let rect = progressbar_core::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 70.0,
+            height: 64.0,
+        };
+        let plan = plan_label_render(&config, rect, "这是一个非常非常长的标题", 1_000, 0, 2_000);
+        assert_eq!(plan.font_size, 16);
+        assert!(matches!(plan.mode, LabelRenderMode::Rotate));
     }
 
     #[test]
