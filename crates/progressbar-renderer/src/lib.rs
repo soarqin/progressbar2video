@@ -3,6 +3,7 @@ use cosmic_text::{
 };
 use progressbar_core::{Layout, TimeMs, Timeline};
 use progressbar_schema::ProjectConfig;
+use std::io::Write;
 use thiserror::Error;
 use tiny_skia::{Color, Paint, Pixmap, Rect, Transform};
 
@@ -14,6 +15,8 @@ pub enum RenderError {
     Layout(String),
     #[error("invalid color `{0}`")]
     Color(String),
+    #[error("png write failed: {0}")]
+    Png(String),
 }
 
 pub struct RenderedFrame {
@@ -72,6 +75,19 @@ pub fn render_frame(
         height: config.render.height,
         rgba: pixmap.take(),
     })
+}
+
+pub fn write_png<W: Write>(frame: &RenderedFrame, writer: W) -> Result<(), RenderError> {
+    let mut encoder = png::Encoder::new(writer, frame.width, frame.height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut png_writer = encoder
+        .write_header()
+        .map_err(|error| RenderError::Png(error.to_string()))?;
+    png_writer
+        .write_image_data(&frame.rgba)
+        .map_err(|error| RenderError::Png(error.to_string()))?;
+    Ok(())
 }
 
 fn draw_playback_progress(
