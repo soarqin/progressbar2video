@@ -5,6 +5,7 @@ use progressbar_renderer::{render_frame, write_png, RenderedFrame};
 use progressbar_schema::ProjectConfig;
 use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,10 +26,18 @@ pub enum EncodeError {
     CreateFrame(std::io::Error),
     #[error("render error: {0}")]
     Render(String),
+    #[error("output format is not an FFmpeg-backed profile")]
+    UnsupportedFfmpegFormat,
     #[error("APNG frame rate {fps} is too high for APNG frame delay")]
     UnsupportedApngFps { fps: u32 },
     #[error("APNG frame count {total_frames} exceeds the format limit")]
     TooManyApngFrames { total_frames: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FfmpegCommandPlan {
+    pub program: PathBuf,
+    pub args: Vec<String>,
 }
 
 pub fn render_png_sequence<F>(
@@ -179,6 +188,55 @@ fn compress_rgba_frame(frame: &RenderedFrame) -> Result<Vec<u8>, EncodeError> {
     encoder.finish().map_err(EncodeError::WriteOutput)
 }
 
+pub fn ffmpeg_command_plan(
+    config: &ProjectConfig,
+    total_frames: u64,
+) -> Result<FfmpegCommandPlan, EncodeError> {
+    let program = config
+        .output
+        .ffmpeg_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("ffmpeg"));
+    let mut args = vec![
+        "-y".to_string(),
+        "-f".to_string(),
+        "rawvideo".to_string(),
+        "-pix_fmt".to_string(),
+        "rgba".to_string(),
+        "-s".to_string(),
+        format!("{}x{}", config.render.width, config.render.height),
+        "-r".to_string(),
+        config.render.fps.to_string(),
+        "-i".to_string(),
+        "pipe:0".to_string(),
+        "-frames:v".to_string(),
+        total_frames.to_string(),
+    ];
+
+    match config.output.format {
+        progressbar_schema::OutputFormat::Ffv1Mkv => {
+            args.extend(["-c:v", "ffv1", "-level", "3", "-pix_fmt", "bgra"].map(String::from));
+        }
+        progressbar_schema::OutputFormat::Prores4444Mov => {
+            args.extend(
+                [
+                    "-c:v",
+                    "prores_ks",
+                    "-profile:v",
+                    "4444",
+                    "-pix_fmt",
+                    "yuva444p10le",
+                ]
+                .map(String::from),
+            );
+        }
+        _ => return Err(EncodeError::UnsupportedFfmpegFormat),
+    }
+
+    args.push(config.output.path.to_string_lossy().to_string());
+    Ok(FfmpegCommandPlan { program, args })
+}
+
 fn write_png_chunk<W: Write>(
     writer: &mut W,
     chunk_type: &[u8; 4],
@@ -206,6 +264,7 @@ mod tests {
     use super::*;
     use progressbar_core::Timeline;
     use progressbar_schema::ProjectConfig;
+    use std::path::PathBuf;
 
     fn png_chunk_names(bytes: &[u8]) -> Vec<String> {
         let mut names = Vec::new();
@@ -267,5 +326,37 @@ mod tests {
         assert!(chunks.contains(&"fdAT".to_string()));
         assert_eq!(seen.last().unwrap().completed_frames, 2);
         assert_eq!(seen.last().unwrap().total_frames, 2);
+    }
+
+    #[test]
+    fn builds_ffv1_command_with_alpha_pixel_format() {
+        let mut config = ProjectConfig::default();
+        config.render.width = 320;
+        config.render.height = 180;
+        config.render.fps = 30;
+        config.output.format = progressbar_schema::OutputFormat::Ffv1Mkv;
+        config.output.path = PathBuf::from("out/progress.mkv");
+        let plan = ffmpeg_command_plan(&config, 60).unwrap();
+        assert_eq!(plan.program, PathBuf::from("ffmpeg"));
+        assert!(plan.args.contains(&"-f".to_string()));
+        assert!(plan.args.contains(&"rawvideo".to_string()));
+        assert!(plan.args.contains(&"rgba".to_string()));
+        assert!(plan.args.contains(&"ffv1".to_string()));
+        assert!(plan.args.contains(&"bgra".to_string()));
+        assert_eq!(plan.args.last().unwrap(), "out/progress.mkv");
+    }
+
+    #[test]
+    fn builds_prores_command_with_explicit_ffmpeg_path() {
+        let mut config = ProjectConfig::default();
+        config.output.format = progressbar_schema::OutputFormat::Prores4444Mov;
+        config.output.path = PathBuf::from("out/progress.mov");
+        config.output.ffmpeg_path = Some(PathBuf::from("tools/ffmpeg.exe"));
+        let plan = ffmpeg_command_plan(&config, 12).unwrap();
+        assert_eq!(plan.program, PathBuf::from("tools/ffmpeg.exe"));
+        assert!(plan.args.contains(&"prores_ks".to_string()));
+        assert!(plan.args.contains(&"4444".to_string()));
+        assert!(plan.args.contains(&"yuva444p10le".to_string()));
+        assert_eq!(plan.args.last().unwrap(), "out/progress.mov");
     }
 }
