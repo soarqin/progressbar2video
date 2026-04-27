@@ -66,7 +66,7 @@ where
     F: FnMut(progressbar_encoder::RenderProgress),
 {
     let (config, timeline) = load_project(request.config_path, request.segments_path)?;
-    progressbar_encoder::render_png_sequence(&config, &timeline, on_progress)
+    progressbar_encoder::render_overlay(&config, &timeline, on_progress)
         .map_err(|error| ApiError::Render(error.to_string()))
 }
 

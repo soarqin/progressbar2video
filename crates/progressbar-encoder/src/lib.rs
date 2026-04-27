@@ -6,6 +6,7 @@ use progressbar_schema::ProjectConfig;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +29,15 @@ pub enum EncodeError {
     Render(String),
     #[error("output format is not an FFmpeg-backed profile")]
     UnsupportedFfmpegFormat,
+    #[error("failed to start ffmpeg `{program}`: {source}")]
+    FfmpegSpawn {
+        program: String,
+        source: std::io::Error,
+    },
+    #[error("failed to write raw frame data to ffmpeg: {0}")]
+    FfmpegStdin(std::io::Error),
+    #[error("ffmpeg exited unsuccessfully with status {status}")]
+    FfmpegExit { status: String },
     #[error("APNG frame rate {fps} is too high for APNG frame delay")]
     UnsupportedApngFps { fps: u32 },
     #[error("APNG frame count {total_frames} exceeds the format limit")]
@@ -38,6 +48,26 @@ pub enum EncodeError {
 pub struct FfmpegCommandPlan {
     pub program: PathBuf,
     pub args: Vec<String>,
+}
+
+pub fn render_overlay<F>(
+    config: &ProjectConfig,
+    timeline: &Timeline,
+    on_progress: F,
+) -> Result<(), EncodeError>
+where
+    F: FnMut(RenderProgress),
+{
+    match config.output.format {
+        progressbar_schema::OutputFormat::PngSequence => {
+            render_png_sequence(config, timeline, on_progress)
+        }
+        progressbar_schema::OutputFormat::Apng => render_apng(config, timeline, on_progress),
+        progressbar_schema::OutputFormat::Ffv1Mkv
+        | progressbar_schema::OutputFormat::Prores4444Mov => {
+            render_ffmpeg(config, timeline, on_progress)
+        }
+    }
 }
 
 pub fn render_png_sequence<F>(
@@ -237,6 +267,56 @@ pub fn ffmpeg_command_plan(
     Ok(FfmpegCommandPlan { program, args })
 }
 
+pub fn render_ffmpeg<F>(
+    config: &ProjectConfig,
+    timeline: &Timeline,
+    mut on_progress: F,
+) -> Result<(), EncodeError>
+where
+    F: FnMut(RenderProgress),
+{
+    let total_frames = frame_count(timeline.duration_ms(), config.render.fps);
+    if let Some(parent) = config.output.path.parent() {
+        fs::create_dir_all(parent).map_err(EncodeError::CreateDir)?;
+    }
+    let plan = ffmpeg_command_plan(config, total_frames)?;
+    let mut child = Command::new(&plan.program)
+        .args(&plan.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|source| EncodeError::FfmpegSpawn {
+            program: plan.program.to_string_lossy().to_string(),
+            source,
+        })?;
+
+    {
+        let stdin = child.stdin.as_mut().expect("stdin was configured as piped");
+        for frame_index in 0..total_frames {
+            let timestamp_ms = frame_timestamp_ms(frame_index, config.render.fps);
+            let frame = render_frame(config, timeline, timestamp_ms)
+                .map_err(|error| EncodeError::Render(error.to_string()))?;
+            stdin
+                .write_all(&frame.rgba)
+                .map_err(EncodeError::FfmpegStdin)?;
+            on_progress(RenderProgress {
+                completed_frames: frame_index + 1,
+                total_frames,
+            });
+        }
+    }
+
+    let status = child.wait().map_err(EncodeError::FfmpegStdin)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(EncodeError::FfmpegExit {
+            status: status.to_string(),
+        })
+    }
+}
+
 fn write_png_chunk<W: Write>(
     writer: &mut W,
     chunk_type: &[u8; 4],
@@ -358,5 +438,23 @@ mod tests {
         assert!(plan.args.contains(&"4444".to_string()));
         assert!(plan.args.contains(&"yuva444p10le".to_string()));
         assert_eq!(plan.args.last().unwrap(), "out/progress.mov");
+    }
+
+    #[test]
+    fn render_overlay_dispatches_apng_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ProjectConfig::default();
+        config.render.width = 96;
+        config.render.height = 54;
+        config.render.fps = 2;
+        config.bar.margin_x = 8;
+        config.bar.margin_bottom = 6;
+        config.bar.height = 16;
+        config.output.format = progressbar_schema::OutputFormat::Apng;
+        config.output.path = dir.path().join("progress.apng");
+        let timeline = Timeline::parse("1 | A").unwrap();
+        render_overlay(&config, &timeline, |_| {}).unwrap();
+        let bytes = std::fs::read(&config.output.path).unwrap();
+        assert!(png_chunk_names(&bytes).contains(&"acTL".to_string()));
     }
 }
