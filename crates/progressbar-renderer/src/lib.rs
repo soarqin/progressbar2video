@@ -154,7 +154,15 @@ fn draw_labels(
             progressbar_schema::TextDisplayMode::None => false,
         };
         if should_draw {
-            draw_label_text(pixmap, config, segment_layout.rect, &segment.label)?;
+            draw_label_text(
+                pixmap,
+                config,
+                segment_layout.rect,
+                &segment.label,
+                timestamp_ms,
+                segment.start_ms,
+                segment.end_ms,
+            )?;
         }
     }
     Ok(())
@@ -165,22 +173,50 @@ fn draw_label_text(
     config: &ProjectConfig,
     rect: progressbar_core::Rect,
     label: &str,
+    timestamp_ms: TimeMs,
+    segment_start_ms: TimeMs,
+    segment_end_ms: TimeMs,
 ) -> Result<(), RenderError> {
     if rect.width <= 1.0 || rect.height <= 1.0 || label.is_empty() {
         return Ok(());
     }
 
+    let plan = plan_label_render(
+        config,
+        rect,
+        label,
+        timestamp_ms,
+        segment_start_ms,
+        segment_end_ms,
+    );
+    draw_text_pixels(pixmap, config, rect, &plan)
+}
+
+fn draw_text_pixels(
+    pixmap: &mut Pixmap,
+    config: &ProjectConfig,
+    rect: progressbar_core::Rect,
+    plan: &LabelRenderPlan,
+) -> Result<(), RenderError> {
+    if plan.text.is_empty() {
+        return Ok(());
+    }
+
     let mut font_system = FontSystem::new();
     let mut swash_cache = SwashCache::new();
-    let font_size = config.text.font_size as f32;
-    let metrics = Metrics::new(font_size, (font_size * 1.2).max(font_size + 2.0));
+    let font_size = plan.font_size as f32;
+    let line_height = (font_size * 1.2).max(font_size + 2.0);
+    let metrics = Metrics::new(font_size, line_height);
     let mut buffer = Buffer::new(&mut font_system, metrics);
     let attrs = Attrs::new().family(Family::Name(&config.text.font_family));
+    let text_width = estimate_text_width(&plan.text, plan.font_size);
+    let buffer_width = text_width.max(rect.width).ceil() + 8.0;
+    let buffer_height = line_height.ceil() + 8.0;
 
     {
         let mut borrowed = buffer.borrow_with(&mut font_system);
-        borrowed.set_size(Some(rect.width.max(1.0)), Some(rect.height.max(1.0)));
-        borrowed.set_text(label, &attrs, Shaping::Advanced, None);
+        borrowed.set_size(Some(buffer_width.max(1.0)), Some(buffer_height.max(1.0)));
+        borrowed.set_text(&plan.text, &attrs, Shaping::Advanced, None);
     }
 
     let text_rgba = parse_color_components(&config.text.color)?;
@@ -190,6 +226,12 @@ fn draw_label_text(
     let clip_right = (rect.x + rect.width).min(pixmap.width() as f32) as i32;
     let clip_bottom = (rect.y + rect.height).min(pixmap.height() as f32) as i32;
     let baseline_y = rect.y + (rect.height - font_size) / 2.0;
+    let base_x = match plan.mode {
+        LabelRenderMode::Normal | LabelRenderMode::Rotate => rect.x + 4.0,
+        LabelRenderMode::Scroll { offset_px } => rect.x + 4.0 + offset_px,
+    };
+    let rotated_x = rect.x + (rect.width - line_height) / 2.0;
+    let rotated_y = rect.y + 4.0;
 
     let mut borrowed = buffer.borrow_with(&mut font_system);
     borrowed.draw(
@@ -199,8 +241,20 @@ fn draw_label_text(
             let [r, g, b, a] = color.as_rgba();
             for dy in 0..height as i32 {
                 for dx in 0..width as i32 {
-                    let px = rect.x as i32 + x + dx;
-                    let py = baseline_y as i32 + y + dy;
+                    let (px, py) = match plan.mode {
+                        LabelRenderMode::Normal | LabelRenderMode::Scroll { .. } => (
+                            base_x.round() as i32 + x + dx,
+                            baseline_y.round() as i32 + y + dy,
+                        ),
+                        LabelRenderMode::Rotate => {
+                            let source_x = (x + dx) as f32;
+                            let source_y = (y + dy) as f32 + font_size;
+                            (
+                                (rotated_x + line_height - source_y).round() as i32,
+                                (rotated_y + source_x).round() as i32,
+                            )
+                        }
+                    };
                     if px >= clip_left && px < clip_right && py >= clip_top && py < clip_bottom {
                         blend_pixel(pixmap, px as u32, py as u32, [r, g, b, a]);
                     }
@@ -496,6 +550,39 @@ mod tests {
     }
 
     #[test]
+    fn scroll_mode_changes_visible_pixels_over_segment_time() {
+        let mut config = ProjectConfig::default();
+        config.render.width = 240;
+        config.render.height = 120;
+        config.bar.margin_x = 20;
+        config.bar.margin_bottom = 16;
+        config.bar.height = 32;
+        config.playback_progress.enabled = false;
+        config.text.overflow = progressbar_schema::OverflowMode::Scroll;
+        config.text.font_size = 22;
+        let timeline = Timeline::parse("2 | very very very long label").unwrap();
+        let start = render_frame(&config, &timeline, 0).unwrap();
+        let later = render_frame(&config, &timeline, 1_800).unwrap();
+        assert_ne!(sample_bar_region(&start), sample_bar_region(&later));
+    }
+
+    #[test]
+    fn rotate_mode_renders_text_across_vertical_segment_space() {
+        let mut config = ProjectConfig::default();
+        config.render.width = 220;
+        config.render.height = 140;
+        config.bar.margin_x = 20;
+        config.bar.margin_bottom = 16;
+        config.bar.height = 72;
+        config.playback_progress.enabled = false;
+        config.text.overflow = progressbar_schema::OverflowMode::Rotate;
+        config.text.font_size = 20;
+        let timeline = Timeline::parse("2 | rotate label").unwrap();
+        let frame = render_frame(&config, &timeline, 500).unwrap();
+        assert!(text_pixel_row_span(&frame) > 35);
+    }
+
+    #[test]
     fn renders_label_pixels_inside_segment_area() {
         let mut config = ProjectConfig::default();
         config.render.width = 640;
@@ -517,5 +604,28 @@ mod tests {
             })
         });
         assert!(has_text_alpha);
+    }
+
+    fn sample_bar_region(frame: &RenderedFrame) -> Vec<[u8; 4]> {
+        (60..90)
+            .flat_map(|y| (30..210).step_by(3).map(move |x| frame.pixel_rgba(x, y)))
+            .collect()
+    }
+
+    fn text_pixel_row_span(frame: &RenderedFrame) -> usize {
+        let fill = [77, 163, 255, 255];
+        let rows: Vec<u32> = (0..frame.height)
+            .filter(|y| {
+                (0..frame.width).any(|x| {
+                    let pixel = frame.pixel_rgba(x, *y);
+                    pixel[3] > 0 && pixel != fill
+                })
+            })
+            .collect();
+
+        match (rows.first(), rows.last()) {
+            (Some(first), Some(last)) => (last - first + 1) as usize,
+            _ => 0,
+        }
     }
 }
