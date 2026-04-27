@@ -1,0 +1,4 @@
+/.worktrees/
+/target/
+/out/
+/examples/**/out/
