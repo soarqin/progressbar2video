@@ -1,0 +1,17 @@
+[package]
+name = "progressbar-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "progressbar2video"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+progressbar-api = { path = "../../crates/progressbar-api" }
+
+[dev-dependencies]
+assert_cmd.workspace = true
+tempfile.workspace = true

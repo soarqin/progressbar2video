@@ -1,4 +1,8 @@
 /.worktrees/
 /target/
+/.idea/
+/.vscode/
+*.pdb
+*.log
 /out/
 /examples/**/out/

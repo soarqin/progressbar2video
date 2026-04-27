@@ -1,0 +1,13 @@
+[package]
+name = "progressbar-renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cosmic-text.workspace = true
+png.workspace = true
+progressbar-core = { path = "../progressbar-core" }
+progressbar-schema = { path = "../progressbar-schema" }
+thiserror.workspace = true
+tiny-skia.workspace = true
