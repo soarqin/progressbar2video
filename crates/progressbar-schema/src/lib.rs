@@ -38,6 +38,9 @@ pub enum OverflowMode {
 #[serde(rename_all = "kebab-case")]
 pub enum OutputFormat {
     PngSequence,
+    Apng,
+    Ffv1Mkv,
+    Prores4444Mov,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -145,6 +148,7 @@ impl Default for TextConfig {
 pub struct OutputConfig {
     pub format: OutputFormat,
     pub path: PathBuf,
+    pub ffmpeg_path: Option<PathBuf>,
 }
 
 impl Default for OutputConfig {
@@ -152,6 +156,7 @@ impl Default for OutputConfig {
         Self {
             format: OutputFormat::PngSequence,
             path: PathBuf::from("out/progress"),
+            ffmpeg_path: None,
         }
     }
 }
@@ -306,5 +311,43 @@ path = "out/progress"
         assert_eq!(config.render.width, 1280);
         assert_eq!(config.text.display_mode, TextDisplayMode::AllSegments);
         assert_eq!(config.output.format, OutputFormat::PngSequence);
+    }
+
+    #[test]
+    fn parses_encoder_output_profiles() {
+        let apng = ProjectConfig::from_toml_str(
+            r#"
+[output]
+format = "apng"
+path = "out/progress.apng"
+"#,
+        )
+        .unwrap();
+        assert_eq!(apng.output.format, OutputFormat::Apng);
+
+        let ffv1 = ProjectConfig::from_toml_str(
+            r#"
+[output]
+format = "ffv1-mkv"
+path = "out/progress.mkv"
+ffmpeg_path = "tools/ffmpeg.exe"
+"#,
+        )
+        .unwrap();
+        assert_eq!(ffv1.output.format, OutputFormat::Ffv1Mkv);
+        assert_eq!(
+            ffv1.output.ffmpeg_path.unwrap(),
+            PathBuf::from("tools/ffmpeg.exe")
+        );
+
+        let prores = ProjectConfig::from_toml_str(
+            r#"
+[output]
+format = "prores4444-mov"
+path = "out/progress.mov"
+"#,
+        )
+        .unwrap();
+        assert_eq!(prores.output.format, OutputFormat::Prores4444Mov);
     }
 }
