@@ -1,7 +1,7 @@
 use crc32fast::Hasher;
 use flate2::{write::ZlibEncoder, Compression};
 use progressbar_core::{frame_count, frame_timestamp_ms, Timeline};
-use progressbar_renderer::{render_frame, write_png, RenderedFrame};
+use progressbar_renderer::{write_png, FrameRenderer, RenderedFrame};
 use progressbar_schema::ProjectConfig;
 use std::fs;
 use std::io::Write;
@@ -80,10 +80,13 @@ where
 {
     let total_frames = frame_count(timeline.duration_ms(), config.render.fps);
     fs::create_dir_all(&config.output.path).map_err(EncodeError::CreateDir)?;
+    let mut renderer = FrameRenderer::new(config, timeline)
+        .map_err(|error| EncodeError::Render(error.to_string()))?;
 
     for frame_index in 0..total_frames {
         let timestamp_ms = frame_timestamp_ms(frame_index, config.render.fps);
-        let frame = render_frame(config, timeline, timestamp_ms)
+        let frame = renderer
+            .render_frame(timestamp_ms)
             .map_err(|error| EncodeError::Render(error.to_string()))?;
         let path = config
             .output
@@ -160,9 +163,12 @@ where
     write_png_chunk(&mut writer, b"acTL", &actl)?;
 
     let mut sequence_number = 0_u32;
+    let mut renderer = FrameRenderer::new(config, timeline)
+        .map_err(|error| EncodeError::Render(error.to_string()))?;
     for frame_index in 0..total_frames {
         let timestamp_ms = frame_timestamp_ms(frame_index, config.render.fps);
-        let frame = render_frame(config, timeline, timestamp_ms)
+        let frame = renderer
+            .render_frame(timestamp_ms)
             .map_err(|error| EncodeError::Render(error.to_string()))?;
         let fctl = apng_frame_control(&frame, sequence_number, delay_den);
         sequence_number += 1;
@@ -280,6 +286,8 @@ where
         fs::create_dir_all(parent).map_err(EncodeError::CreateDir)?;
     }
     let plan = ffmpeg_command_plan(config, total_frames)?;
+    let mut renderer = FrameRenderer::new(config, timeline)
+        .map_err(|error| EncodeError::Render(error.to_string()))?;
     let mut child = Command::new(&plan.program)
         .args(&plan.args)
         .stdin(Stdio::piped())
@@ -295,7 +303,8 @@ where
         let stdin = child.stdin.as_mut().expect("stdin was configured as piped");
         for frame_index in 0..total_frames {
             let timestamp_ms = frame_timestamp_ms(frame_index, config.render.fps);
-            let frame = render_frame(config, timeline, timestamp_ms)
+            let frame = renderer
+                .render_frame(timestamp_ms)
                 .map_err(|error| EncodeError::Render(error.to_string()))?;
             stdin
                 .write_all(&frame.rgba)
