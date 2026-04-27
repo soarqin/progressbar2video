@@ -605,6 +605,8 @@ dependencies = [
 name = "progressbar-encoder"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
+ "flate2",
  "progressbar-core",
  "progressbar-renderer",
  "progressbar-schema",

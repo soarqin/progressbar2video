@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+crc32fast.workspace = true
+flate2.workspace = true
 progressbar-core = { path = "../progressbar-core" }
 progressbar-renderer = { path = "../progressbar-renderer" }
 progressbar-schema = { path = "../progressbar-schema" }
