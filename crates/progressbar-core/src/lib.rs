@@ -132,6 +132,92 @@ fn parse_seconds_ms(value: &str) -> Result<TimeMs, ()> {
     Ok(seconds * 1_000 + millis)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentLayout {
+    pub segment_index: usize,
+    pub rect: Rect,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Layout {
+    pub bar: Rect,
+    pub segments: Vec<SegmentLayout>,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum LayoutError {
+    #[error("timeline duration must be greater than zero")]
+    EmptyDuration,
+}
+
+impl Layout {
+    pub fn calculate(
+        config: &progressbar_schema::ProjectConfig,
+        timeline: &Timeline,
+    ) -> Result<Self, LayoutError> {
+        let duration = timeline.duration_ms();
+        if duration == 0 {
+            return Err(LayoutError::EmptyDuration);
+        }
+
+        let x = config.bar.margin_x as f32;
+        let width = (config.render.width - config.bar.margin_x * 2) as f32;
+        let height = config.bar.height as f32;
+        let y = (config.render.height - config.bar.margin_bottom - config.bar.height) as f32;
+        let bar = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+
+        let segments = timeline
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(segment_index, segment)| {
+                let start_ratio = segment.start_ms as f32 / duration as f32;
+                let end_ratio = segment.end_ms as f32 / duration as f32;
+                let segment_x = x + width * start_ratio;
+                let segment_width = width * (end_ratio - start_ratio);
+                SegmentLayout {
+                    segment_index,
+                    rect: Rect {
+                        x: segment_x,
+                        y,
+                        width: segment_width,
+                        height,
+                    },
+                }
+            })
+            .collect();
+
+        Ok(Self { bar, segments })
+    }
+}
+
+pub fn frame_count(duration_ms: TimeMs, fps: u32) -> u64 {
+    if duration_ms == 0 || fps == 0 {
+        return 0;
+    }
+    ((duration_ms as u128 * fps as u128 + 999) / 1000) as u64
+}
+
+pub fn frame_timestamp_ms(frame_index: u64, fps: u32) -> TimeMs {
+    if fps == 0 {
+        return 0;
+    }
+    ((frame_index as u128 * 1000) / fps as u128) as TimeMs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +263,24 @@ mod tests {
         assert_eq!(timeline.active_segment_index(10_000), Some(1));
         assert_eq!(timeline.active_segment_index(20_000), Some(1));
         assert_eq!(timeline.active_segment_index(20_001), None);
+    }
+
+    #[test]
+    fn calculates_duration_proportional_layout() {
+        let timeline = Timeline::parse("10 | A\n30 | B").unwrap();
+        let config = progressbar_schema::ProjectConfig::default();
+        let layout = Layout::calculate(&config, &timeline).unwrap();
+        assert_eq!(layout.bar.x, 80.0);
+        assert_eq!(layout.bar.width, 1760.0);
+        assert_eq!(layout.segments.len(), 2);
+        assert!((layout.segments[0].rect.width - 586.6667).abs() < 0.01);
+        assert!((layout.segments[1].rect.width - 1173.3333).abs() < 0.01);
+    }
+
+    #[test]
+    fn derives_frame_count_from_final_end_time() {
+        let timeline = Timeline::parse("2 | A").unwrap();
+        assert_eq!(frame_count(timeline.duration_ms(), 60), 120);
+        assert_eq!(frame_count(2_001, 60), 121);
     }
 }
