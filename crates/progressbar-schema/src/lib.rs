@@ -31,6 +31,7 @@ pub enum OverflowMode {
     Ellipsis,
     Rotate,
     Scroll,
+    Wrap,
     Auto,
 }
 
@@ -128,6 +129,13 @@ pub struct TextConfig {
     pub color: String,
     pub display_mode: TextDisplayMode,
     pub overflow: OverflowMode,
+    /// Extra pixels between wrapped lines, on top of the line's `font_size`.
+    ///
+    /// Only applied when the resolved overflow strategy is `Wrap`. The total
+    /// wrapped height used for `auto` fallback decisions and rendering is
+    /// `lines * font_size + (lines - 1) * line_spacing` so the last line does
+    /// not contribute a trailing gap.
+    pub line_spacing: u32,
 }
 
 impl Default for TextConfig {
@@ -139,6 +147,7 @@ impl Default for TextConfig {
             color: "#FFFFFF".to_string(),
             display_mode: TextDisplayMode::AllSegments,
             overflow: OverflowMode::Auto,
+            line_spacing: 4,
         }
     }
 }
@@ -302,6 +311,7 @@ min_font_size = 18
 color = "#FFFFFF"
 display_mode = "all-segments"
 overflow = "auto"
+line_spacing = 6
 
 [output]
 format = "png-sequence"
@@ -310,7 +320,28 @@ path = "out/progress"
         let config = ProjectConfig::from_toml_str(toml).unwrap();
         assert_eq!(config.render.width, 1280);
         assert_eq!(config.text.display_mode, TextDisplayMode::AllSegments);
+        assert_eq!(config.text.line_spacing, 6);
         assert_eq!(config.output.format, OutputFormat::PngSequence);
+    }
+
+    #[test]
+    fn parses_wrap_overflow_with_line_spacing() {
+        let config = ProjectConfig::from_toml_str(
+            r#"
+[text]
+overflow = "wrap"
+line_spacing = 10
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.text.overflow, OverflowMode::Wrap);
+        assert_eq!(config.text.line_spacing, 10);
+    }
+
+    #[test]
+    fn line_spacing_defaults_when_omitted() {
+        let config = ProjectConfig::default();
+        assert_eq!(config.text.line_spacing, 4);
     }
 
     #[test]

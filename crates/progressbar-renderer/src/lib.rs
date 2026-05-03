@@ -127,12 +127,17 @@ impl FrameRenderer {
                     segment.start_ms,
                     segment.end_ms,
                 );
-                let mode = match plan.mode {
-                    LabelRenderMode::Normal => CachedLabelMode::Normal,
-                    LabelRenderMode::Rotate => CachedLabelMode::Rotate,
-                    LabelRenderMode::Scroll { .. } => CachedLabelMode::Scroll,
+                let (mode, wrapped_lines, line_spacing) = match &plan.mode {
+                    LabelRenderMode::Normal => (CachedLabelMode::Normal, Vec::new(), 0),
+                    LabelRenderMode::Rotate => (CachedLabelMode::Rotate, Vec::new(), 0),
+                    LabelRenderMode::Scroll { .. } => (CachedLabelMode::Scroll, Vec::new(), 0),
+                    LabelRenderMode::Wrap {
+                        lines,
+                        line_spacing,
+                    } => (CachedLabelMode::Wrap, lines.clone(), *line_spacing),
                 };
-                let measured_width = estimate_text_width(&plan.text, plan.font_size);
+                let measured_width =
+                    progressbar_core::estimate_text_width(&plan.text, plan.font_size);
                 CachedLabel {
                     segment_index: segment_layout.segment_index,
                     rect: segment_layout.rect,
@@ -142,6 +147,8 @@ impl FrameRenderer {
                     start_ms: segment.start_ms,
                     end_ms: segment.end_ms,
                     measured_width,
+                    wrapped_lines,
+                    line_spacing,
                 }
             })
             .collect()
@@ -228,6 +235,10 @@ struct CachedLabel {
     start_ms: TimeMs,
     end_ms: TimeMs,
     measured_width: f32,
+    /// Pre-wrapped lines, populated only when `mode == Wrap`. Empty otherwise.
+    wrapped_lines: Vec<String>,
+    /// Extra pixels between wrapped lines, only used by `Wrap` rendering.
+    line_spacing: u32,
 }
 
 impl CachedLabel {
@@ -237,6 +248,10 @@ impl CachedLabel {
             CachedLabelMode::Rotate => LabelRenderMode::Rotate,
             CachedLabelMode::Scroll => LabelRenderMode::Scroll {
                 offset_px: self.scroll_offset(timestamp_ms),
+            },
+            CachedLabelMode::Wrap => LabelRenderMode::Wrap {
+                lines: self.wrapped_lines.clone(),
+                line_spacing: self.line_spacing,
             },
         };
         LabelRenderPlan {
@@ -263,6 +278,7 @@ enum CachedLabelMode {
     Normal,
     Rotate,
     Scroll,
+    Wrap,
 }
 
 pub fn render_frame(
@@ -337,23 +353,57 @@ fn draw_text_pixels(
     font_system: &mut FontSystem,
     swash_cache: &mut SwashCache,
 ) -> Result<(), RenderError> {
-    if plan.text.is_empty() {
-        return Ok(());
-    }
-
     let font_size = plan.font_size as f32;
-    let line_height = (font_size * 1.2).max(font_size + 2.0);
+
+    // Wrap mode renders the pre-computed wrapped lines as a single multi-line
+    // cosmic_text buffer with `line_height = font_size + line_spacing` so the
+    // last line does not contribute a trailing gap. Other modes keep the
+    // existing single-line metrics.
+    let (line_height, render_text, wrapped_block_height) = match &plan.mode {
+        LabelRenderMode::Wrap {
+            lines,
+            line_spacing,
+        } => {
+            if lines.is_empty() {
+                return Ok(());
+            }
+            let lh = font_size + *line_spacing as f32;
+            let block_height = progressbar_core::wrapped_height_px(
+                lines.len() as u32,
+                plan.font_size,
+                *line_spacing,
+            );
+            (lh, lines.join("\n"), block_height)
+        }
+        _ => {
+            if plan.text.is_empty() {
+                return Ok(());
+            }
+            let lh = (font_size * 1.2).max(font_size + 2.0);
+            (lh, plan.text.clone(), font_size)
+        }
+    };
+
     let metrics = Metrics::new(font_size, line_height);
     let mut buffer = Buffer::new(font_system, metrics);
     let attrs = Attrs::new().family(Family::Name(&config.text.font_family));
-    let text_width = estimate_text_width(&plan.text, plan.font_size);
-    let buffer_width = text_width.max(rect.width).ceil() + 8.0;
-    let buffer_height = line_height.ceil() + 8.0;
+    let text_width = progressbar_core::estimate_text_width(&plan.text, plan.font_size);
+    let (buffer_width, buffer_height) = match &plan.mode {
+        LabelRenderMode::Wrap { .. } => {
+            // Use a generous buffer width so cosmic_text does not re-wrap our
+            // pre-split lines because of small width-estimation differences.
+            (rect.width.max(1.0) + 64.0, wrapped_block_height + 16.0)
+        }
+        _ => (
+            text_width.max(rect.width).ceil() + 8.0,
+            line_height.ceil() + 8.0,
+        ),
+    };
 
     {
         let mut borrowed = buffer.borrow_with(font_system);
         borrowed.set_size(Some(buffer_width.max(1.0)), Some(buffer_height.max(1.0)));
-        borrowed.set_text(&plan.text, &attrs, Shaping::Advanced, None);
+        borrowed.set_text(&render_text, &attrs, Shaping::Advanced, None);
     }
 
     let text_rgba = parse_color_components(&config.text.color)?;
@@ -362,10 +412,19 @@ fn draw_text_pixels(
     let clip_top = rect.y.max(0.0) as i32;
     let clip_right = (rect.x + rect.width).min(pixmap.width() as f32) as i32;
     let clip_bottom = (rect.y + rect.height).min(pixmap.height() as f32) as i32;
-    let baseline_y = rect.y + (rect.height - font_size) / 2.0;
-    let base_x = match plan.mode {
-        LabelRenderMode::Normal | LabelRenderMode::Rotate => rect.x + 4.0,
-        LabelRenderMode::Scroll { offset_px } => rect.x + 4.0 + offset_px,
+    let baseline_y = match &plan.mode {
+        LabelRenderMode::Wrap { .. } => {
+            // Center the wrapped block when it fits; otherwise top-align so
+            // the bottom of the overflowing block is what gets clipped.
+            rect.y + ((rect.height - wrapped_block_height) / 2.0).max(0.0)
+        }
+        _ => rect.y + (rect.height - font_size) / 2.0,
+    };
+    let base_x = match &plan.mode {
+        LabelRenderMode::Normal | LabelRenderMode::Rotate | LabelRenderMode::Wrap { .. } => {
+            rect.x + 4.0
+        }
+        LabelRenderMode::Scroll { offset_px } => rect.x + 4.0 + *offset_px,
     };
     let rotated_x = rect.x + (rect.width - line_height) / 2.0;
     let rotated_y = rect.y + 4.0;
@@ -375,8 +434,10 @@ fn draw_text_pixels(
         let [r, g, b, a] = color.as_rgba();
         for dy in 0..height as i32 {
             for dx in 0..width as i32 {
-                let (px, py) = match plan.mode {
-                    LabelRenderMode::Normal | LabelRenderMode::Scroll { .. } => (
+                let (px, py) = match &plan.mode {
+                    LabelRenderMode::Normal
+                    | LabelRenderMode::Scroll { .. }
+                    | LabelRenderMode::Wrap { .. } => (
                         base_x.round() as i32 + x + dx,
                         baseline_y.round() as i32 + y + dy,
                     ),
@@ -406,18 +467,17 @@ struct LabelRenderPlan {
     mode: LabelRenderMode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum LabelRenderMode {
     Normal,
     Rotate,
-    Scroll { offset_px: f32 },
-}
-
-fn estimate_text_width(text: &str, font_size: u32) -> f32 {
-    text.chars()
-        .map(|ch| if ch.is_ascii() { 0.58 } else { 1.0 })
-        .sum::<f32>()
-        * font_size as f32
+    Scroll {
+        offset_px: f32,
+    },
+    Wrap {
+        lines: Vec<String>,
+        line_spacing: u32,
+    },
 }
 
 fn can_rotate_label(rect: progressbar_core::Rect, min_font_size: u32) -> bool {
@@ -432,13 +492,15 @@ fn plan_label_render(
     segment_start_ms: TimeMs,
     segment_end_ms: TimeMs,
 ) -> LabelRenderPlan {
-    let text_width = estimate_text_width(label, config.text.font_size);
+    let text_width = progressbar_core::estimate_text_width(label, config.text.font_size);
     let decision = progressbar_core::choose_text_strategy(progressbar_core::TextStrategyInput {
         overflow: config.text.overflow.clone(),
         text_width_px: text_width,
         rect_width_px: rect.width.max(1.0),
+        rect_height_px: rect.height.max(0.0),
         font_size: config.text.font_size,
         min_font_size: config.text.min_font_size,
+        line_spacing: config.text.line_spacing,
         can_rotate: can_rotate_label(rect, config.text.min_font_size),
     });
 
@@ -465,7 +527,7 @@ fn plan_label_render(
                 end_ms: segment_end_ms,
                 label: label.to_string(),
             };
-            let measured = estimate_text_width(label, font_size);
+            let measured = progressbar_core::estimate_text_width(label, font_size);
             LabelRenderPlan {
                 text: label.to_string(),
                 font_size,
@@ -479,11 +541,22 @@ fn plan_label_render(
                 },
             }
         }
+        progressbar_core::TextStrategyDecision::Wrap { font_size, .. } => {
+            let lines = progressbar_core::wrap_text_lines(label, font_size, rect.width.max(1.0));
+            LabelRenderPlan {
+                text: label.to_string(),
+                font_size,
+                mode: LabelRenderMode::Wrap {
+                    lines,
+                    line_spacing: config.text.line_spacing,
+                },
+            }
+        }
     }
 }
 
 fn ellipsize_to_width(label: &str, font_size: u32, max_width: f32) -> String {
-    if estimate_text_width(label, font_size) <= max_width {
+    if progressbar_core::estimate_text_width(label, font_size) <= max_width {
         return label.to_string();
     }
 
@@ -491,7 +564,7 @@ fn ellipsize_to_width(label: &str, font_size: u32, max_width: f32) -> String {
     let mut output = String::new();
     for ch in label.chars() {
         let candidate = format!("{output}{ch}{ellipsis}");
-        if estimate_text_width(&candidate, font_size) > max_width {
+        if progressbar_core::estimate_text_width(&candidate, font_size) > max_width {
             break;
         }
         output.push(ch);
@@ -657,7 +730,7 @@ mod tests {
         let plan = plan_label_render(&config, rect, "这是一个非常非常长的标题", 0, 0, 2_000);
         assert!(matches!(plan.mode, LabelRenderMode::Normal));
         assert!(plan.text.ends_with("..."));
-        assert!(estimate_text_width(&plan.text, plan.font_size) <= rect.width);
+        assert!(progressbar_core::estimate_text_width(&plan.text, plan.font_size) <= rect.width);
     }
 
     #[test]
@@ -679,19 +752,151 @@ mod tests {
 
     #[test]
     fn auto_rotate_plan_uses_min_font_size_for_narrow_tall_cells() {
+        // Use a label long enough that wrap height exceeds the bar at every
+        // size in [min_font_size, font_size]; that forces auto to fall through
+        // wrap and pick the rotation fallback.
         let mut config = ProjectConfig::default();
         config.text.overflow = progressbar_schema::OverflowMode::Auto;
         config.text.font_size = 28;
         config.text.min_font_size = 16;
+        config.text.line_spacing = 4;
         let rect = progressbar_core::Rect {
             x: 0.0,
             y: 0.0,
             width: 70.0,
             height: 64.0,
         };
-        let plan = plan_label_render(&config, rect, "这是一个非常非常长的标题", 1_000, 0, 2_000);
+        let plan = plan_label_render(
+            &config,
+            rect,
+            "这是一个非常非常非常长长长的标题",
+            1_000,
+            0,
+            2_000,
+        );
         assert_eq!(plan.font_size, 16);
         assert!(matches!(plan.mode, LabelRenderMode::Rotate));
+    }
+
+    #[test]
+    fn auto_wrap_plan_when_text_height_fits_bar() {
+        // Tall bar with auto overflow: wrap has higher priority than the
+        // existing chain, so the plan should be a multi-line wrap.
+        let mut config = ProjectConfig::default();
+        config.text.overflow = progressbar_schema::OverflowMode::Auto;
+        config.text.font_size = 20;
+        config.text.min_font_size = 14;
+        config.text.line_spacing = 4;
+        let rect = progressbar_core::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 80.0,
+        };
+        let plan = plan_label_render(&config, rect, "abcdefghijabcdefghij", 0, 0, 2_000);
+        match &plan.mode {
+            LabelRenderMode::Wrap {
+                lines,
+                line_spacing,
+            } => {
+                assert!(lines.len() >= 2, "expected wrapped lines, got {lines:?}");
+                assert_eq!(*line_spacing, 4);
+                assert_eq!(plan.font_size, 20);
+            }
+            other => panic!("expected Wrap plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_wrap_plan_falls_back_to_min_font_size_when_too_tall() {
+        // Bar shorter than min_font_size's wrap height. Explicit wrap mode
+        // still returns a Wrap plan rendered at min_font_size and clipped.
+        let mut config = ProjectConfig::default();
+        config.text.overflow = progressbar_schema::OverflowMode::Wrap;
+        config.text.font_size = 28;
+        config.text.min_font_size = 16;
+        config.text.line_spacing = 6;
+        let rect = progressbar_core::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 60.0,
+            height: 12.0,
+        };
+        let plan = plan_label_render(&config, rect, "这是一个非常非常长的标题", 0, 0, 2_000);
+        assert_eq!(plan.font_size, 16);
+        match &plan.mode {
+            LabelRenderMode::Wrap {
+                lines,
+                line_spacing,
+            } => {
+                assert!(lines.len() >= 2);
+                assert_eq!(*line_spacing, 6);
+            }
+            other => panic!("expected Wrap plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrap_mode_draws_multiple_text_rows_in_segment() {
+        // Render a frame with wrap enabled and verify text alpha lives in
+        // multiple distinct vertical rows of the bar.
+        let mut config = ProjectConfig::default();
+        config.render.width = 320;
+        config.render.height = 180;
+        config.bar.margin_x = 20;
+        config.bar.margin_bottom = 16;
+        config.bar.height = 80;
+        config.playback_progress.enabled = false;
+        config.text.overflow = progressbar_schema::OverflowMode::Wrap;
+        config.text.font_size = 18;
+        config.text.min_font_size = 12;
+        config.text.line_spacing = 4;
+        let timeline = Timeline::parse("2 | wrap me into multiple lines please").unwrap();
+        let frame = render_frame(&config, &timeline, 500).unwrap();
+        let bar_y = 180 - 16 - 80;
+        let fill = [77, 163, 255, 255];
+        let rows_with_text: Vec<u32> = (bar_y..bar_y + 80)
+            .filter(|y| {
+                (0..frame.width).any(|x| {
+                    let pixel = frame.pixel_rgba(x, *y as u32);
+                    pixel[3] > 0 && pixel != fill
+                })
+            })
+            .map(|y| y as u32)
+            .collect();
+        // With wrap into multiple rows, the painted rows should span more
+        // vertical pixels than a single line would.
+        let span = rows_with_text
+            .last()
+            .zip(rows_with_text.first())
+            .map(|(last, first)| (last - first) as i32 + 1)
+            .unwrap_or(0);
+        assert!(
+            span > config.text.font_size as i32 + 4,
+            "wrapped span {span}px should exceed a single-line height",
+        );
+    }
+
+    #[test]
+    fn wrap_mode_keeps_static_frames_identical_across_time() {
+        // Wrap is time-invariant per segment, so the cached static layer must
+        // produce identical pixel output at any timestamp inside a segment.
+        let mut config = ProjectConfig::default();
+        config.render.width = 320;
+        config.render.height = 180;
+        config.bar.margin_x = 20;
+        config.bar.margin_bottom = 16;
+        config.bar.height = 60;
+        config.playback_progress.enabled = false;
+        config.text.overflow = progressbar_schema::OverflowMode::Wrap;
+        config.text.font_size = 18;
+        config.text.min_font_size = 12;
+        config.text.line_spacing = 4;
+        let timeline = Timeline::parse("2 | wrap me into multiple lines please").unwrap();
+        let mut renderer = FrameRenderer::new(&config, &timeline).unwrap();
+        let first = renderer.render_frame(100).unwrap();
+        let second = renderer.render_frame(1_900).unwrap();
+        assert_eq!(first.rgba, second.rgba);
     }
 
     #[test]

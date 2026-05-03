@@ -30,7 +30,11 @@ font_size = 24
 min_font_size = 14
 color = "#FFFFFF"
 display_mode = "all-segments"
+# `auto` tries wrap (highest priority) first, then shrink → ellipsis →
+# rotate → scroll. `line_spacing` controls the gap between wrapped lines and
+# is only consulted when the resolved strategy is `wrap`.
 overflow = "auto"
+line_spacing = 4
 
 [output]
 format = "png-sequence"
