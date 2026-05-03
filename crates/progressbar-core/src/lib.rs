@@ -49,10 +49,11 @@ impl Timeline {
             let (time_text, label_text) = trimmed
                 .split_once('|')
                 .ok_or(SegmentParseError::MissingSeparator { line: line_number })?;
-            let label = label_text.trim();
-            if label.is_empty() {
+            let label_trimmed = label_text.trim();
+            if label_trimmed.is_empty() {
                 return Err(SegmentParseError::MissingLabel { line: line_number });
             }
+            let label = decode_label_escapes(label_trimmed);
 
             let end_ms =
                 parse_time_ms(time_text.trim()).map_err(|_| SegmentParseError::InvalidTime {
@@ -70,7 +71,7 @@ impl Timeline {
             segments.push(Segment {
                 start_ms: previous_end_ms,
                 end_ms,
-                label: label.to_string(),
+                label,
             });
             previous_end_ms = end_ms;
         }
@@ -101,6 +102,36 @@ impl Timeline {
                 (timestamp_ms == self.segments[last_index].end_ms).then_some(last_index)
             })
     }
+}
+
+/// Decode the small set of escape sequences accepted in segment labels:
+///
+/// - `\n` becomes a literal `\n` (line feed) used as a hard line break in
+///   every renderer mode.
+/// - `\\` becomes a single backslash so users can opt out of the `\n` escape
+///   when they need a literal `\n` in the rendered text.
+///
+/// Any other backslash sequence is preserved verbatim so unknown escapes do
+/// not silently swallow characters.
+fn decode_label_escapes(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => output.push('\n'),
+            Some('\\') => output.push('\\'),
+            Some(other) => {
+                output.push('\\');
+                output.push(other);
+            }
+            None => output.push('\\'),
+        }
+    }
+    output
 }
 
 pub fn parse_time_ms(value: &str) -> Result<TimeMs, ()> {
@@ -219,16 +250,19 @@ pub fn frame_timestamp_ms(frame_index: u64, fps: u32) -> TimeMs {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TextStrategyInput {
+pub struct TextStrategyInput<'a> {
     pub overflow: progressbar_schema::OverflowMode,
-    pub text_width_px: f32,
+    /// Full label text, possibly containing `\n` line feeds. Hard newlines are
+    /// honored as forced line breaks in every renderer mode.
+    pub text: &'a str,
     pub rect_width_px: f32,
     /// Vertical budget the wrapped text may consume before falling back to
     /// other strategies. Pass the segment cell height for bar-bounded text.
     pub rect_height_px: f32,
     pub font_size: u32,
     pub min_font_size: u32,
-    /// Extra pixels between wrapped lines (only used by `Wrap` decisions).
+    /// Extra pixels between stacked text lines, applied whenever a render
+    /// produces more than one line (forced `\n`, wrap, etc.).
     pub line_spacing: u32,
     pub can_rotate: bool,
 }
@@ -243,10 +277,18 @@ pub enum TextStrategyDecision {
     Wrap { font_size: u32, lines: u32 },
 }
 
-pub fn choose_text_strategy(input: TextStrategyInput) -> TextStrategyDecision {
+pub fn choose_text_strategy(input: TextStrategyInput<'_>) -> TextStrategyDecision {
     use progressbar_schema::OverflowMode;
 
-    if input.text_width_px <= input.rect_width_px {
+    let max_line_width = max_logical_line_width(input.text, input.font_size);
+    let forced_lines = forced_line_count(input.text);
+    let forced_height = wrapped_height_px(forced_lines, input.font_size, input.line_spacing);
+
+    // Text is `Normal` only when it fits both horizontally (no logical line
+    // exceeds the cell width) and vertically (the forced multi-line block
+    // fits inside the bar). Multi-line forced labels can therefore still
+    // demand an overflow strategy when they get too tall.
+    if max_line_width <= input.rect_width_px && forced_height <= input.rect_height_px {
         return TextStrategyDecision::Normal {
             font_size: input.font_size,
         };
@@ -269,9 +311,8 @@ pub fn choose_text_strategy(input: TextStrategyInput) -> TextStrategyDecision {
             // Even at min_font_size the wrap is too tall for the bar; the user
             // explicitly chose `wrap`, so render at min_font_size and let the
             // renderer clip to the bar bounds.
-            let scaled =
-                scaled_text_width(input.text_width_px, input.font_size, input.min_font_size);
-            let lines = lines_for_width(scaled, input.rect_width_px);
+            let lines =
+                wrap_line_count_at_size(input.text, input.min_font_size, input.rect_width_px);
             TextStrategyDecision::Wrap {
                 font_size: input.min_font_size,
                 lines,
@@ -285,15 +326,16 @@ pub fn choose_text_strategy(input: TextStrategyInput) -> TextStrategyDecision {
             if let Some(decision) = try_shrink_and_wrap(&input) {
                 return decision;
             }
-            let shrink_ratio = input.rect_width_px / input.text_width_px;
-            let shrunk_size = ((input.font_size as f32 * shrink_ratio).floor() as u32)
-                .clamp(input.min_font_size, input.font_size);
-            if shrunk_size > input.min_font_size {
-                return TextStrategyDecision::Shrink {
-                    font_size: shrunk_size,
-                };
+            // Shrink fallback: find the largest size in [min, font_size] whose
+            // forced multi-line block fits both width and height, then return
+            // Shrink. If only `min_font_size` works (or nothing does), fall
+            // through to ellipsis/rotate/scroll.
+            if let Some(shrunk) = shrink_to_fit(&input) {
+                if shrunk > input.min_font_size {
+                    return TextStrategyDecision::Shrink { font_size: shrunk };
+                }
             }
-            if input.text_width_px <= input.rect_width_px * 1.8 {
+            if max_line_width <= input.rect_width_px * 1.8 {
                 return TextStrategyDecision::Ellipsis {
                     font_size: input.min_font_size,
                 };
@@ -315,16 +357,19 @@ pub fn choose_text_strategy(input: TextStrategyInput) -> TextStrategyDecision {
 /// `Some(Shrink)` when the text becomes a single line at that size (no actual
 /// wrapping needed) or `Some(Wrap)` when it requires multiple lines. Returns
 /// `None` when no size in the range fits.
-fn try_shrink_and_wrap(input: &TextStrategyInput) -> Option<TextStrategyDecision> {
+fn try_shrink_and_wrap(input: &TextStrategyInput<'_>) -> Option<TextStrategyDecision> {
     if input.font_size == 0 || input.min_font_size > input.font_size {
         return None;
     }
+    let forced_lines = forced_line_count(input.text);
     for fs in (input.min_font_size..=input.font_size).rev() {
-        let scaled = scaled_text_width(input.text_width_px, input.font_size, fs);
-        let lines = lines_for_width(scaled, input.rect_width_px);
+        let lines = wrap_line_count_at_size(input.text, fs, input.rect_width_px);
         let height = wrapped_height_px(lines, fs, input.line_spacing);
         if height <= input.rect_height_px {
-            if lines <= 1 {
+            // If the wrap collapses to exactly one physical line per logical
+            // line we report Shrink so the renderer stays in single-line
+            // semantics for non-wrapping segments.
+            if lines == forced_lines {
                 return Some(TextStrategyDecision::Shrink { font_size: fs });
             }
             return Some(TextStrategyDecision::Wrap {
@@ -336,21 +381,22 @@ fn try_shrink_and_wrap(input: &TextStrategyInput) -> Option<TextStrategyDecision
     None
 }
 
-fn scaled_text_width(text_width_px: f32, font_size: u32, target_font_size: u32) -> f32 {
-    if font_size == 0 {
-        return 0.0;
+/// Largest font size in `[min_font_size, font_size]` whose forced multi-line
+/// block (no auto-wrap) fits both `rect_width_px` and `rect_height_px`. Used
+/// by the auto fallback chain when wrap could not satisfy the height budget.
+fn shrink_to_fit(input: &TextStrategyInput<'_>) -> Option<u32> {
+    if input.font_size == 0 || input.min_font_size > input.font_size {
+        return None;
     }
-    text_width_px * (target_font_size as f32 / font_size as f32)
-}
-
-fn lines_for_width(text_width_px: f32, rect_width_px: f32) -> u32 {
-    if rect_width_px <= 0.0 {
-        return 1;
+    let forced_lines = forced_line_count(input.text);
+    for fs in (input.min_font_size..=input.font_size).rev() {
+        let scaled = max_logical_line_width(input.text, fs);
+        let height = wrapped_height_px(forced_lines, fs, input.line_spacing);
+        if scaled <= input.rect_width_px && height <= input.rect_height_px {
+            return Some(fs);
+        }
     }
-    if text_width_px <= rect_width_px {
-        return 1;
-    }
-    ((text_width_px / rect_width_px).ceil() as u32).max(1)
+    None
 }
 
 /// Total vertical pixels needed for `lines` text lines. The trailing gap after
@@ -363,37 +409,79 @@ pub fn wrapped_height_px(lines: u32, font_size: u32, line_spacing: u32) -> f32 {
     lines as f32 * font_size as f32 + lines.saturating_sub(1) as f32 * line_spacing as f32
 }
 
-/// Approximate width of `text` rendered at `font_size`. The same heuristic is
-/// used by [`wrap_text_lines`] so wrap line counts agree with strategy width
-/// estimates.
+/// Approximate width of `text` at `font_size`. When the text contains hard
+/// newlines, the **widest** logical line determines the overall width, so a
+/// caller can compare it against `rect_width_px` to decide whether any
+/// horizontal overflow occurs.
 pub fn estimate_text_width(text: &str, font_size: u32) -> f32 {
-    text.chars().map(|ch| char_advance(ch, font_size)).sum()
+    max_logical_line_width(text, font_size)
 }
 
-/// Greedy character-aware wrap that splits `text` into lines no wider than
-/// `max_width` using the same per-character advance as [`estimate_text_width`].
-/// Returns an empty vector for empty input.
+/// Width of the widest logical line (segments separated by `\n`). Returns 0
+/// for empty input.
+pub fn max_logical_line_width(text: &str, font_size: u32) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    text.split('\n')
+        .map(|line| {
+            line.chars()
+                .map(|ch| char_advance(ch, font_size))
+                .sum::<f32>()
+        })
+        .fold(0.0_f32, f32::max)
+}
+
+/// Number of logical lines in `text`, treating `\n` as a hard line break. The
+/// minimum is 1 so empty input still represents one line.
+pub fn forced_line_count(text: &str) -> u32 {
+    if text.is_empty() {
+        return 1;
+    }
+    let count = text.split('\n').count() as u32;
+    count.max(1)
+}
+
+/// Greedy character-aware wrap that honors `\n` as a hard line break and then
+/// splits each logical line into pieces no wider than `max_width`. Empty
+/// logical lines are preserved as empty strings so the caller can space them.
 pub fn wrap_text_lines(text: &str, font_size: u32, max_width: f32) -> Vec<String> {
     if text.is_empty() {
         return Vec::new();
     }
     let max_width = max_width.max(0.0);
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    let mut current_width = 0.0_f32;
-    for ch in text.chars() {
-        let advance = char_advance(ch, font_size);
-        if !current.is_empty() && current_width + advance > max_width {
-            lines.push(std::mem::take(&mut current));
-            current_width = 0.0;
+    let mut all_lines = Vec::new();
+    for logical in text.split('\n') {
+        if logical.is_empty() {
+            // Preserve the empty logical line so consecutive `\n`s create
+            // visible blank rows in the rendered output.
+            all_lines.push(String::new());
+            continue;
         }
-        current.push(ch);
-        current_width += advance;
+        let mut current = String::new();
+        let mut current_width = 0.0_f32;
+        for ch in logical.chars() {
+            let advance = char_advance(ch, font_size);
+            if !current.is_empty() && current_width + advance > max_width {
+                all_lines.push(std::mem::take(&mut current));
+                current_width = 0.0;
+            }
+            current.push(ch);
+            current_width += advance;
+        }
+        if !current.is_empty() {
+            all_lines.push(current);
+        }
     }
-    if !current.is_empty() {
-        lines.push(current);
+    all_lines
+}
+
+fn wrap_line_count_at_size(text: &str, font_size: u32, max_width: f32) -> u32 {
+    if text.is_empty() {
+        return 1;
     }
-    lines
+    let count = wrap_text_lines(text, font_size, max_width).len() as u32;
+    count.max(1)
 }
 
 fn char_advance(ch: char, font_size: u32) -> f32 {
@@ -487,9 +575,10 @@ mod tests {
     fn auto_uses_scroll_only_after_min_font_size() {
         // Bar is too short for any wrap height, so wrap fallback unwinds to
         // the existing shrink/ellipsis/rotate/scroll chain.
+        let text = "一".repeat(18);
         let decision = choose_text_strategy(TextStrategyInput {
             overflow: progressbar_schema::OverflowMode::Auto,
-            text_width_px: 500.0,
+            text: &text,
             rect_width_px: 100.0,
             rect_height_px: 30.0,
             font_size: 28,
@@ -504,9 +593,10 @@ mod tests {
     fn auto_prefers_rotation_for_narrow_cells_when_allowed() {
         // Wrap height at min_font_size still exceeds the bar height, so the
         // existing rotation fallback is selected.
+        let text = "一".repeat(11);
         let decision = choose_text_strategy(TextStrategyInput {
             overflow: progressbar_schema::OverflowMode::Auto,
-            text_width_px: 300.0,
+            text: &text,
             rect_width_px: 80.0,
             rect_height_px: 60.0,
             font_size: 28,
@@ -519,9 +609,10 @@ mod tests {
 
     #[test]
     fn explicit_scroll_uses_configured_font_size() {
+        let text = "一".repeat(11);
         let decision = choose_text_strategy(TextStrategyInput {
             overflow: progressbar_schema::OverflowMode::Scroll,
-            text_width_px: 300.0,
+            text: &text,
             rect_width_px: 80.0,
             rect_height_px: 60.0,
             font_size: 28,
@@ -536,9 +627,10 @@ mod tests {
     fn auto_picks_wrap_when_lines_fit_bar_height() {
         // 200px text in a 100px-wide cell wraps into 2 lines at font_size 20:
         // height = 2*20 + 1*4 = 44, which fits the 60px bar.
+        let text = "一".repeat(10);
         let decision = choose_text_strategy(TextStrategyInput {
             overflow: progressbar_schema::OverflowMode::Auto,
-            text_width_px: 200.0,
+            text: &text,
             rect_width_px: 100.0,
             rect_height_px: 60.0,
             font_size: 20,
@@ -559,9 +651,10 @@ mod tests {
     fn auto_wrap_shrinks_until_height_fits() {
         // At font_size 24: lines = 4, height = 4*24 + 3*4 = 108 > 70 → too tall.
         // Shrink loop scans down; the first size that fits gets returned.
+        let text = "一".repeat(15);
         let decision = choose_text_strategy(TextStrategyInput {
             overflow: progressbar_schema::OverflowMode::Auto,
-            text_width_px: 360.0,
+            text: &text,
             rect_width_px: 100.0,
             rect_height_px: 70.0,
             font_size: 24,
@@ -590,9 +683,10 @@ mod tests {
     fn explicit_wrap_clips_when_no_size_fits() {
         // Bar is shorter than even a single line at min_font_size; explicit
         // wrap must still return a Wrap decision (the renderer clips).
+        let text = "一".repeat(18);
         let decision = choose_text_strategy(TextStrategyInput {
             overflow: progressbar_schema::OverflowMode::Wrap,
-            text_width_px: 500.0,
+            text: &text,
             rect_width_px: 80.0,
             rect_height_px: 10.0,
             font_size: 28,
@@ -615,7 +709,7 @@ mod tests {
         // overflow mode.
         let decision = choose_text_strategy(TextStrategyInput {
             overflow: progressbar_schema::OverflowMode::Wrap,
-            text_width_px: 50.0,
+            text: "一一",
             rect_width_px: 100.0,
             rect_height_px: 60.0,
             font_size: 24,
@@ -648,5 +742,107 @@ mod tests {
         assert_eq!(wrapped_height_px(1, 20, 6), 20.0);
         assert_eq!(wrapped_height_px(3, 20, 6), 3.0 * 20.0 + 2.0 * 6.0);
         assert_eq!(wrapped_height_px(0, 20, 6), 0.0);
+    }
+
+    #[test]
+    fn segment_parser_decodes_newline_escape() {
+        let timeline = Timeline::parse(r"5 | line one\nline two").unwrap();
+        assert_eq!(timeline.segments[0].label, "line one\nline two");
+    }
+
+    #[test]
+    fn segment_parser_keeps_double_backslash_as_literal_escape() {
+        // `\\n` in the source means literal backslash + 'n', not a newline.
+        let timeline = Timeline::parse(r"5 | path\\nfile").unwrap();
+        assert_eq!(timeline.segments[0].label, r"path\nfile");
+    }
+
+    #[test]
+    fn segment_parser_preserves_unknown_escape_sequences() {
+        // Unsupported escapes pass through verbatim so users do not lose data.
+        let timeline = Timeline::parse(r"5 | tab\there").unwrap();
+        assert_eq!(timeline.segments[0].label, r"tab\there");
+    }
+
+    #[test]
+    fn estimate_text_width_returns_widest_logical_line() {
+        // Longest line wins, regardless of total character count.
+        let width = estimate_text_width("ab\nabcdef\nabcd", 10);
+        let expected = "abcdef".chars().count() as f32 * 0.58 * 10.0;
+        assert!((width - expected).abs() < 0.001);
+    }
+
+    #[test]
+    fn forced_line_count_counts_logical_lines() {
+        assert_eq!(forced_line_count(""), 1);
+        assert_eq!(forced_line_count("hello"), 1);
+        assert_eq!(forced_line_count("hello\nworld"), 2);
+        assert_eq!(forced_line_count("a\n\nb"), 3);
+    }
+
+    #[test]
+    fn wrap_text_lines_honors_hard_newlines_and_then_wraps_each_line() {
+        let lines = wrap_text_lines("abcdef\n12345678", 10, 30.0);
+        // First logical line (6 chars) wraps into two physical rows; the
+        // second logical line (8 chars) wraps into two as well.
+        assert_eq!(lines.len(), 4);
+        assert_eq!(&lines[0], "abcde");
+        assert_eq!(&lines[1], "f");
+        assert_eq!(&lines[2], "12345");
+        assert_eq!(&lines[3], "678");
+    }
+
+    #[test]
+    fn wrap_text_lines_preserves_blank_logical_lines() {
+        // Two consecutive `\n`s create an empty logical row that should not
+        // disappear from the rendered output.
+        let lines = wrap_text_lines("a\n\nb", 10, 100.0);
+        assert_eq!(lines, vec!["a".to_string(), String::new(), "b".to_string()]);
+    }
+
+    #[test]
+    fn forced_newline_inflates_normal_height_check() {
+        // A 2-line label cannot stay Normal when the bar height is shorter
+        // than the forced multi-line block.
+        let decision = choose_text_strategy(TextStrategyInput {
+            overflow: progressbar_schema::OverflowMode::Auto,
+            text: "ab\ncd",
+            rect_width_px: 200.0,
+            // Two-line forced block needs 2*20 + 1*4 = 44px, this is 30px.
+            rect_height_px: 30.0,
+            font_size: 20,
+            min_font_size: 12,
+            line_spacing: 4,
+            can_rotate: false,
+        });
+        // With width to spare, auto should shrink the forced block to fit.
+        match decision {
+            TextStrategyDecision::Shrink { font_size }
+            | TextStrategyDecision::Wrap { font_size, .. } => {
+                assert!(font_size <= 20 && font_size >= 12);
+                let block = wrapped_height_px(2, font_size, 4);
+                assert!(
+                    block <= 30.0,
+                    "shrunk block {block}px should fit bar height 30",
+                );
+            }
+            other => panic!("expected Shrink/Wrap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forced_newline_returns_normal_when_block_fits_both_axes() {
+        // Two-line label that fits in width and height stays Normal.
+        let decision = choose_text_strategy(TextStrategyInput {
+            overflow: progressbar_schema::OverflowMode::Auto,
+            text: "ab\ncd",
+            rect_width_px: 200.0,
+            rect_height_px: 80.0,
+            font_size: 20,
+            min_font_size: 12,
+            line_spacing: 4,
+            can_rotate: false,
+        });
+        assert_eq!(decision, TextStrategyDecision::Normal { font_size: 20 });
     }
 }
