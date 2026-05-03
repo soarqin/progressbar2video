@@ -1,5 +1,5 @@
 use cosmic_text::{
-    Attrs, Buffer, Color as TextColor, Family, FontSystem, Metrics, Shaping, SwashCache,
+    Attrs, Buffer, Color as TextColor, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap,
 };
 use progressbar_core::{Layout, TimeMs, Timeline};
 use progressbar_schema::ProjectConfig;
@@ -372,9 +372,16 @@ fn draw_text_pixels(
     }
 
     match plan.mode {
-        LabelRenderMode::Static => {
-            draw_stacked_lines(pixmap, config, rect, plan, font_system, swash_cache, 0.0)
-        }
+        LabelRenderMode::Static => draw_stacked_lines(
+            pixmap,
+            config,
+            rect,
+            plan,
+            font_system,
+            swash_cache,
+            0.0,
+            true,
+        ),
         LabelRenderMode::Scroll { offset_px } => draw_stacked_lines(
             pixmap,
             config,
@@ -383,6 +390,7 @@ fn draw_text_pixels(
             font_system,
             swash_cache,
             offset_px,
+            false,
         ),
         LabelRenderMode::Rotate => {
             draw_rotated_columns(pixmap, config, rect, plan, font_system, swash_cache)
@@ -390,9 +398,18 @@ fn draw_text_pixels(
     }
 }
 
-/// Draw the plan's lines stacked vertically inside `rect`. `horizontal_offset`
-/// shifts the entire block left/right so Scroll mode can animate a multi-line
-/// label as one rigid unit.
+/// Draw the plan's lines stacked vertically inside `rect`.
+///
+/// - `horizontal_offset` shifts the entire block left/right so Scroll mode can
+///   animate a multi-line label as one rigid unit.
+/// - When `align_center` is true each line is independently centered inside
+///   `rect.width`, using cosmic-text's actual measured line width. When false
+///   each line is left-anchored at `rect.x + horizontal_offset`.
+///
+/// Centering is applied by reading the laid-out `LayoutRun::line_w` and
+/// rasterising each glyph manually via `SwashCache::with_pixels` because
+/// cosmic-text's built-in `Align::Center` only takes effect when the buffer's
+/// wrap mode is allowed to consult `width_opt` (Wrap::None disables it).
 fn draw_stacked_lines(
     pixmap: &mut Pixmap,
     config: &ProjectConfig,
@@ -401,6 +418,7 @@ fn draw_stacked_lines(
     font_system: &mut FontSystem,
     swash_cache: &mut SwashCache,
     horizontal_offset: f32,
+    align_center: bool,
 ) -> Result<(), RenderError> {
     if plan.lines.iter().all(|line| line.is_empty()) {
         return Ok(());
@@ -424,15 +442,23 @@ fn draw_stacked_lines(
         .iter()
         .map(|line| progressbar_core::estimate_text_width(line, plan.font_size))
         .fold(0.0_f32, f32::max);
-    // Buffer is sized generously so cosmic_text does not auto-wrap our
-    // already-prepared lines because of small width-estimation differences.
+    // Generous buffer width: with `Wrap::None` cosmic-text never re-wraps,
+    // and we compute centering ourselves against `rect.width` in the draw
+    // loop. Sizing the buffer this way leaves room for lines whose actual
+    // shaped width slightly exceeds our heuristic estimate.
     let buffer_width = max_line_width.max(rect.width).ceil() + 64.0;
     let buffer_height = total_height.ceil() + 16.0;
 
     {
         let mut borrowed = buffer.borrow_with(font_system);
-        borrowed.set_size(Some(buffer_width.max(1.0)), Some(buffer_height.max(1.0)));
+        // Honor our pre-wrapped lines verbatim - we already split text at
+        // every desired break point, including the user's literal `\n`.
+        borrowed.set_wrap(Wrap::None);
+        borrowed.set_size(Some(buffer_width), Some(buffer_height.max(1.0)));
         borrowed.set_text(&joined, &attrs, Shaping::Advanced, None);
+        // Layout must be resolved before iterating `layout_runs`; without
+        // this the runs would reflect the previous (empty) state.
+        borrowed.shape_until_scroll(false);
     }
 
     let text_rgba = parse_color_components(&config.text.color)?;
@@ -443,33 +469,49 @@ fn draw_stacked_lines(
     let clip_bottom = (rect.y + rect.height).min(pixmap.height() as f32) as i32;
     // Center the multi-line block when it fits, otherwise top-align so any
     // overflow is clipped at the bar bottom rather than the top.
-    let baseline_y = if total_height <= rect.height {
+    let block_top_y = if total_height <= rect.height {
         rect.y + (rect.height - total_height) / 2.0
     } else {
         rect.y
     };
-    let base_x = rect.x + 4.0 + horizontal_offset;
 
-    let mut borrowed = buffer.borrow_with(font_system);
-    borrowed.draw(swash_cache, text_color, |x, y, width, height, color| {
-        let [r, g, b, a] = color.as_rgba();
-        for dy in 0..height as i32 {
-            for dx in 0..width as i32 {
-                let px = base_x.round() as i32 + x + dx;
-                let py = baseline_y.round() as i32 + y + dy;
-                if px >= clip_left && px < clip_right && py >= clip_top && py < clip_bottom {
-                    blend_pixel(pixmap, px as u32, py as u32, [r, g, b, a]);
-                }
-            }
+    for run in buffer.layout_runs() {
+        // Per-line horizontal offset using cosmic-text's measured line width
+        // so any drift between our heuristic and the real shaped width
+        // becomes a small symmetric overflow rather than a right-edge clip.
+        let line_x_offset = if align_center {
+            (rect.width - run.line_w) / 2.0
+        } else {
+            0.0
+        };
+        let glyph_offset_x = rect.x + line_x_offset + horizontal_offset;
+        let glyph_offset_y = block_top_y + run.line_y;
+        for glyph in run.glyphs.iter() {
+            let physical = glyph.physical((glyph_offset_x, glyph_offset_y), 1.0);
+            let glyph_color = glyph.color_opt.unwrap_or(text_color);
+            swash_cache.with_pixels(
+                font_system,
+                physical.cache_key,
+                glyph_color,
+                |dx, dy, pixel_color| {
+                    let px = physical.x + dx;
+                    let py = physical.y + dy;
+                    if px >= clip_left && px < clip_right && py >= clip_top && py < clip_bottom {
+                        let [r, g, b, a] = pixel_color.as_rgba();
+                        blend_pixel(pixmap, px as u32, py as u32, [r, g, b, a]);
+                    }
+                },
+            );
         }
-    });
+    }
 
     Ok(())
 }
 
 /// Draw each plan line as its own rotated column laid out side-by-side. Hard
 /// newlines therefore become extra columns rather than running into one wide
-/// rotated string.
+/// rotated string. Each column is vertically centered inside the cell so the
+/// rotated text reads from the middle outward instead of top-down.
 fn draw_rotated_columns(
     pixmap: &mut Pixmap,
     config: &ProjectConfig,
@@ -498,7 +540,6 @@ fn draw_rotated_columns(
     let clip_top = rect.y.max(0.0) as i32;
     let clip_right = (rect.x + rect.width).min(pixmap.width() as f32) as i32;
     let clip_bottom = (rect.y + rect.height).min(pixmap.height() as f32) as i32;
-    let rotated_y = rect.y + 4.0;
     let attrs = Attrs::new().family(Family::Name(&config.text.font_family));
 
     for (i, line_text) in plan.lines.iter().enumerate() {
@@ -513,11 +554,21 @@ fn draw_rotated_columns(
 
         {
             let mut borrowed = buffer.borrow_with(font_system);
+            borrowed.set_wrap(Wrap::None);
             borrowed.set_size(Some(buffer_width.max(1.0)), Some(buffer_height.max(1.0)));
             borrowed.set_text(line_text, &attrs, Shaping::Advanced, None);
         }
 
         let column_x = columns_start_x + i as f32 * (column_thickness + line_spacing);
+        // Per-column vertical centering: the rotated glyphs run along the
+        // y-axis, so positioning the start at `(rect.height - line_width)/2`
+        // keeps each column centered. Long lines that exceed the cell height
+        // anchor at the top edge so clipping happens at the bottom.
+        let rotated_y = if line_width <= rect.height {
+            rect.y + (rect.height - line_width) / 2.0
+        } else {
+            rect.y
+        };
 
         let mut borrowed = buffer.borrow_with(font_system);
         borrowed.draw(swash_cache, text_color, |x, y, width, height, color| {
@@ -768,6 +819,110 @@ mod tests {
     use super::*;
     use progressbar_core::Timeline;
     use progressbar_schema::ProjectConfig;
+
+    #[test]
+    fn static_text_does_not_clip_right_edge_when_width_matches_estimate() {
+        // Reproduce the bug the user reported: a label whose estimated width
+        // equals `rect.width` used to be drawn from `rect.x + 4`, eating four
+        // pixels off the right edge. After the fix the painted alpha must
+        // stay strictly inside the cell.
+        let mut config = ProjectConfig::default();
+        config.render.width = 320;
+        config.render.height = 180;
+        config.bar.margin_x = 20;
+        config.bar.margin_bottom = 16;
+        config.bar.height = 60;
+        config.playback_progress.enabled = false;
+        // Disable the segment divider so the test does not pick it up as
+        // "text alpha" when scanning the leftmost/rightmost painted column.
+        config.bar.divider_color = "#00000000".to_string();
+        config.bar.fill_color = "#00000000".to_string();
+        config.bar.track_color = "#00000000".to_string();
+        config.text.overflow = progressbar_schema::OverflowMode::Ellipsis;
+        config.text.font_size = 18;
+        config.text.min_font_size = 12;
+        // Build a label that comfortably overflows so ellipsis kicks in and
+        // returns a string close to the cell's full width after truncation.
+        let label = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let timeline = Timeline::parse(&format!("2 | {label}")).unwrap();
+        let frame = render_frame(&config, &timeline, 500).unwrap();
+
+        let cell_left = 20u32;
+        let cell_right = 320u32 - 20;
+        let bar_top = (180 - 16 - 60) as u32;
+        let bar_bottom = bar_top + 60;
+        let mut leftmost = None;
+        let mut rightmost = None;
+        for y in bar_top..bar_bottom {
+            for x in 0..320u32 {
+                if frame.pixel_rgba(x, y)[3] > 0 {
+                    leftmost = Some(leftmost.map_or(x, |prev: u32| prev.min(x)));
+                    rightmost = Some(rightmost.map_or(x, |prev: u32| prev.max(x)));
+                }
+            }
+        }
+        let left = leftmost.expect("expected painted text inside the bar");
+        let right = rightmost.expect("expected painted text inside the bar");
+        assert!(
+            left >= cell_left,
+            "text should not paint left of the cell ({left} < {cell_left})",
+        );
+        assert!(
+            right < cell_right,
+            "text should not paint at or past the cell's right edge \
+             ({right} >= {cell_right})",
+        );
+    }
+
+    #[test]
+    fn static_text_is_horizontally_centered_inside_cell() {
+        // After the centering fix the painted text should sit symmetrically
+        // inside the cell. We allow a few pixels of asymmetry to account for
+        // rounding and font-metric vs. heuristic differences.
+        let mut config = ProjectConfig::default();
+        config.render.width = 320;
+        config.render.height = 180;
+        config.bar.margin_x = 30;
+        config.bar.margin_bottom = 16;
+        config.bar.height = 60;
+        config.playback_progress.enabled = false;
+        // Strip the bar/divider/track colors so that the only opaque pixels
+        // captured below are the rendered glyphs themselves.
+        config.bar.divider_color = "#00000000".to_string();
+        config.bar.fill_color = "#00000000".to_string();
+        config.bar.track_color = "#00000000".to_string();
+        config.text.overflow = progressbar_schema::OverflowMode::Auto;
+        config.text.font_size = 22;
+        config.text.min_font_size = 14;
+        let timeline = Timeline::parse("2 | hello").unwrap();
+        let frame = render_frame(&config, &timeline, 500).unwrap();
+
+        let cell_left = 30u32;
+        let cell_right = 320u32 - 30;
+        let bar_top = (180 - 16 - 60) as u32;
+        let bar_bottom = bar_top + 60;
+        let mut leftmost = None;
+        let mut rightmost = None;
+        for y in bar_top..bar_bottom {
+            for x in 0..320u32 {
+                if frame.pixel_rgba(x, y)[3] > 0 {
+                    leftmost = Some(leftmost.map_or(x, |prev: u32| prev.min(x)));
+                    rightmost = Some(rightmost.map_or(x, |prev: u32| prev.max(x)));
+                }
+            }
+        }
+        let left = leftmost.expect("expected painted text") as i32;
+        let right = rightmost.expect("expected painted text") as i32;
+        let left_gap = left - cell_left as i32;
+        let right_gap = (cell_right as i32 - 1) - right;
+        let asymmetry = (left_gap - right_gap).abs();
+        assert!(
+            asymmetry <= 4,
+            "text should be roughly horizontally centered \
+             (left_gap={left_gap}, right_gap={right_gap}, \
+             asymmetry={asymmetry}px)",
+        );
+    }
 
     #[test]
     fn renders_transparent_background_pixels() {
