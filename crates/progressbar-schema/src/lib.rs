@@ -27,7 +27,14 @@ pub enum TextDisplayMode {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum OverflowMode {
+    /// Use a single uniform font size for every segment, picked as the
+    /// smallest size needed by any segment so all of them fit in their own
+    /// cell. Visually consistent across the whole timeline.
     Shrink,
+    /// Each segment is shrunk independently to the largest size in
+    /// `[min_font_size, font_size]` that fits its own cell. Different
+    /// segments may end up at different sizes.
+    ShrinkFit,
     Ellipsis,
     Rotate,
     Scroll,
@@ -322,6 +329,18 @@ path = "out/progress"
         assert_eq!(config.text.display_mode, TextDisplayMode::AllSegments);
         assert_eq!(config.text.line_spacing, 6);
         assert_eq!(config.output.format, OutputFormat::PngSequence);
+    }
+
+    #[test]
+    fn parses_shrink_fit_overflow() {
+        let config = ProjectConfig::from_toml_str(
+            r#"
+[text]
+overflow = "shrink-fit"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.text.overflow, OverflowMode::ShrinkFit);
     }
 
     #[test]

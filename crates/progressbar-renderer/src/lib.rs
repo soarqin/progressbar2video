@@ -114,6 +114,32 @@ impl FrameRenderer {
     }
 
     fn build_cached_labels(&self) -> Vec<CachedLabel> {
+        // The uniform `Shrink` mode requires whole-timeline knowledge: the
+        // single font size we end up using is the most-constrained segment's
+        // optimum, so every cell fits at that size. Compute it once here and
+        // hand it to `plan_label_render` as an override.
+        let uniform_shrink_override = if matches!(
+            self.config.text.overflow,
+            progressbar_schema::OverflowMode::Shrink
+        ) {
+            let segments_iter = self.layout.segments.iter().map(|segment_layout| {
+                let segment = &self.timeline.segments[segment_layout.segment_index];
+                (
+                    segment.label.as_str(),
+                    segment_layout.rect.width.max(0.0),
+                    segment_layout.rect.height.max(0.0),
+                )
+            });
+            Some(progressbar_core::uniform_shrink_size_for_segments(
+                segments_iter,
+                self.config.text.font_size,
+                self.config.text.min_font_size,
+                self.config.text.line_spacing,
+            ))
+        } else {
+            None
+        };
+
         self.layout
             .segments
             .iter()
@@ -126,6 +152,7 @@ impl FrameRenderer {
                     segment.start_ms,
                     segment.start_ms,
                     segment.end_ms,
+                    uniform_shrink_override,
                 );
                 let mode = match plan.mode {
                     LabelRenderMode::Static => CachedLabelMode::Static,
@@ -624,7 +651,21 @@ fn plan_label_render(
     timestamp_ms: TimeMs,
     segment_start_ms: TimeMs,
     segment_end_ms: TimeMs,
+    uniform_font_size_override: Option<u32>,
 ) -> LabelRenderPlan {
+    if let Some(uniform_size) = uniform_font_size_override {
+        // The uniform `Shrink` overflow mode bypasses per-segment strategy
+        // selection so every segment renders at the same pre-computed size
+        // - hard newlines are still honored, but no wrapping or ellipsis is
+        // applied; a too-wide segment is simply clipped at the cell edge.
+        return LabelRenderPlan {
+            lines: split_logical_lines(label),
+            font_size: uniform_size,
+            line_spacing: config.text.line_spacing,
+            mode: LabelRenderMode::Static,
+        };
+    }
+
     let decision = progressbar_core::choose_text_strategy(progressbar_core::TextStrategyInput {
         overflow: config.text.overflow.clone(),
         text: label,
@@ -967,6 +1008,75 @@ mod tests {
     }
 
     #[test]
+    fn shrink_mode_picks_uniform_font_size_across_segments() {
+        // Build a timeline with one short and one long label so they have
+        // very different per-segment shrink optima. Uniform Shrink must
+        // pick the smaller of the two and apply it to every cached label.
+        let mut config = ProjectConfig::default();
+        config.render.width = 400;
+        config.render.height = 200;
+        config.bar.margin_x = 20;
+        config.bar.margin_bottom = 16;
+        config.bar.height = 60;
+        config.playback_progress.enabled = false;
+        config.text.overflow = progressbar_schema::OverflowMode::Shrink;
+        config.text.font_size = 28;
+        config.text.min_font_size = 8;
+        config.text.line_spacing = 4;
+        let timeline = Timeline::parse("1 | 短\n2 | 长长长长长长长长长长长").unwrap();
+        let renderer = FrameRenderer::new(&config, &timeline).unwrap();
+        let sizes: Vec<u32> = renderer.labels.iter().map(|c| c.font_size).collect();
+        assert_eq!(
+            sizes.len(),
+            2,
+            "expected one cached label per segment: {sizes:?}",
+        );
+        assert!(
+            sizes.windows(2).all(|w| w[0] == w[1]),
+            "Shrink should yield a single uniform font size; got {sizes:?}",
+        );
+        // Same uniform size must equal the most-constrained segment's optimum.
+        let expected_uniform = progressbar_core::uniform_shrink_size_for_segments(
+            renderer.layout.segments.iter().map(|seg| {
+                let segment = &renderer.timeline.segments[seg.segment_index];
+                (segment.label.as_str(), seg.rect.width, seg.rect.height)
+            }),
+            config.text.font_size,
+            config.text.min_font_size,
+            config.text.line_spacing,
+        );
+        assert_eq!(sizes[0], expected_uniform);
+    }
+
+    #[test]
+    fn shrink_fit_mode_lets_each_segment_pick_its_own_font_size() {
+        // Same timeline, but ShrinkFit lets each segment shrink independently
+        // - the long segment must end up smaller than the short one.
+        let mut config = ProjectConfig::default();
+        config.render.width = 400;
+        config.render.height = 200;
+        config.bar.margin_x = 20;
+        config.bar.margin_bottom = 16;
+        config.bar.height = 60;
+        config.playback_progress.enabled = false;
+        config.text.overflow = progressbar_schema::OverflowMode::ShrinkFit;
+        config.text.font_size = 28;
+        config.text.min_font_size = 8;
+        config.text.line_spacing = 4;
+        let timeline = Timeline::parse("1 | 短\n2 | 长长长长长长长长长长长").unwrap();
+        let renderer = FrameRenderer::new(&config, &timeline).unwrap();
+        let sizes: Vec<u32> = renderer.labels.iter().map(|c| c.font_size).collect();
+        assert_eq!(sizes.len(), 2, "expected two cached labels: {sizes:?}");
+        assert!(
+            sizes[0] > sizes[1],
+            "expected the short segment ({}) to keep a larger font than the \
+             long segment ({})",
+            sizes[0],
+            sizes[1],
+        );
+    }
+
+    #[test]
     fn ellipsis_plan_shortens_text_to_fit_rect() {
         let mut config = ProjectConfig::default();
         config.text.overflow = progressbar_schema::OverflowMode::Ellipsis;
@@ -978,7 +1088,7 @@ mod tests {
             width: 80.0,
             height: 40.0,
         };
-        let plan = plan_label_render(&config, rect, "这是一个非常非常长的标题", 0, 0, 2_000);
+        let plan = plan_label_render(&config, rect, "这是一个非常非常长的标题", 0, 0, 2_000, None);
         assert!(matches!(plan.mode, LabelRenderMode::Static));
         assert_eq!(plan.lines.len(), 1);
         assert!(plan.lines[0].ends_with("..."));
@@ -999,7 +1109,15 @@ mod tests {
             width: 70.0,
             height: 12.0,
         };
-        let plan = plan_label_render(&config, rect, "这是一个非常非常长的标题", 1_000, 0, 2_000);
+        let plan = plan_label_render(
+            &config,
+            rect,
+            "这是一个非常非常长的标题",
+            1_000,
+            0,
+            2_000,
+            None,
+        );
         assert_eq!(plan.font_size, 16);
         assert!(matches!(plan.mode, LabelRenderMode::Scroll { .. }));
     }
@@ -1027,6 +1145,7 @@ mod tests {
             1_000,
             0,
             2_000,
+            None,
         );
         assert_eq!(plan.font_size, 16);
         assert!(matches!(plan.mode, LabelRenderMode::Rotate));
@@ -1048,7 +1167,7 @@ mod tests {
             width: 100.0,
             height: 80.0,
         };
-        let plan = plan_label_render(&config, rect, "abcdefghijabcdefghij", 0, 0, 2_000);
+        let plan = plan_label_render(&config, rect, "abcdefghijabcdefghij", 0, 0, 2_000, None);
         assert!(matches!(plan.mode, LabelRenderMode::Static));
         assert!(
             plan.lines.len() >= 2,
@@ -1074,7 +1193,7 @@ mod tests {
             width: 60.0,
             height: 12.0,
         };
-        let plan = plan_label_render(&config, rect, "这是一个非常非常长的标题", 0, 0, 2_000);
+        let plan = plan_label_render(&config, rect, "这是一个非常非常长的标题", 0, 0, 2_000, None);
         assert_eq!(plan.font_size, 16);
         assert_eq!(plan.line_spacing, 6);
         assert!(matches!(plan.mode, LabelRenderMode::Static));
@@ -1137,7 +1256,7 @@ mod tests {
             width: 200.0,
             height: 80.0,
         };
-        let plan = plan_label_render(&config, rect, "first line\nsecond line", 0, 0, 2_000);
+        let plan = plan_label_render(&config, rect, "first line\nsecond line", 0, 0, 2_000, None);
         assert!(matches!(plan.mode, LabelRenderMode::Static));
         assert_eq!(plan.lines, vec!["first line", "second line"]);
         assert_eq!(plan.font_size, 18);
@@ -1162,6 +1281,7 @@ mod tests {
             0,
             0,
             2_000,
+            None,
         );
         assert!(matches!(plan.mode, LabelRenderMode::Static));
         assert_eq!(plan.lines.len(), 2);
@@ -1187,7 +1307,7 @@ mod tests {
             width: 60.0,
             height: 200.0,
         };
-        let plan = plan_label_render(&config, rect, "一二三四五六\n甲乙丙", 0, 0, 2_000);
+        let plan = plan_label_render(&config, rect, "一二三四五六\n甲乙丙", 0, 0, 2_000, None);
         assert!(matches!(plan.mode, LabelRenderMode::Static));
         // First logical line (6 CJK chars at 18px) wraps at 60px → two rows;
         // second line (3 chars) fits in one row.
@@ -1220,7 +1340,7 @@ mod tests {
             width: 30.0,
             height: 120.0,
         };
-        let plan = plan_label_render(&config, rect, "first\nsecond\nthird", 0, 0, 2_000);
+        let plan = plan_label_render(&config, rect, "first\nsecond\nthird", 0, 0, 2_000, None);
         assert!(matches!(plan.mode, LabelRenderMode::Rotate));
         assert_eq!(plan.lines, vec!["first", "second", "third"]);
     }
@@ -1246,6 +1366,7 @@ mod tests {
             500,
             0,
             2_000,
+            None,
         );
         assert!(matches!(plan.mode, LabelRenderMode::Scroll { .. }));
         assert_eq!(plan.lines, vec!["horizontal scroll line one", "short"]);

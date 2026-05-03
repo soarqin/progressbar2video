@@ -296,8 +296,18 @@ pub fn choose_text_strategy(input: TextStrategyInput<'_>) -> TextStrategyDecisio
 
     match input.overflow {
         OverflowMode::Shrink => TextStrategyDecision::Shrink {
+            // The renderer overrides this in build_cached_labels with a
+            // timeline-wide uniform value. Returning `min_font_size` here is
+            // a safe per-segment default for callers (mostly tests) that
+            // invoke `choose_text_strategy` outside of a timeline context.
             font_size: input.min_font_size,
         },
+        OverflowMode::ShrinkFit => {
+            // Each segment shrinks independently to the largest size that
+            // fits. If even `min_font_size` doesn't fit, the renderer clips.
+            let fs = shrink_to_fit(&input).unwrap_or(input.min_font_size);
+            TextStrategyDecision::Shrink { font_size: fs }
+        }
         OverflowMode::Ellipsis => TextStrategyDecision::Ellipsis {
             font_size: input.font_size,
         },
@@ -397,6 +407,70 @@ fn shrink_to_fit(input: &TextStrategyInput<'_>) -> Option<u32> {
         }
     }
     None
+}
+
+/// Largest font size in `[min_font_size, font_size]` for which `text` fits the
+/// given cell. Used both for per-segment shrink-fit decisions and as the
+/// building block of the timeline-wide uniform shrink. When no size in the
+/// range fits, returns `min_font_size` so the renderer can clip a too-wide
+/// label rather than disappear it.
+pub fn shrink_fit_for_cell(
+    text: &str,
+    rect_width_px: f32,
+    rect_height_px: f32,
+    font_size: u32,
+    min_font_size: u32,
+    line_spacing: u32,
+) -> u32 {
+    if font_size == 0 {
+        return 0;
+    }
+    if min_font_size >= font_size {
+        return font_size;
+    }
+    let forced_lines = forced_line_count(text);
+    for fs in (min_font_size..=font_size).rev() {
+        let scaled = max_logical_line_width(text, fs);
+        let height = wrapped_height_px(forced_lines, fs, line_spacing);
+        if scaled <= rect_width_px && height <= rect_height_px {
+            return fs;
+        }
+    }
+    min_font_size
+}
+
+/// Smallest [`shrink_fit_for_cell`] across `segments`, used by the uniform
+/// `Shrink` overflow mode so every segment renders at the same font size and
+/// the most-constrained segment still fits.
+///
+/// `segments` yields `(text, rect_width_px, rect_height_px)` per cell. When
+/// the iterator is empty (e.g. no segments) the input `font_size` is returned
+/// unchanged.
+pub fn uniform_shrink_size_for_segments<'a, I>(
+    segments: I,
+    font_size: u32,
+    min_font_size: u32,
+    line_spacing: u32,
+) -> u32
+where
+    I: IntoIterator<Item = (&'a str, f32, f32)>,
+{
+    let mut overall: Option<u32> = None;
+    for (text, rect_width_px, rect_height_px) in segments {
+        let fitted = shrink_fit_for_cell(
+            text,
+            rect_width_px,
+            rect_height_px,
+            font_size,
+            min_font_size,
+            line_spacing,
+        );
+        overall = Some(match overall {
+            Some(prev) => prev.min(fitted),
+            None => fitted,
+        });
+    }
+    overall.unwrap_or(font_size)
 }
 
 /// Total vertical pixels needed for `lines` text lines. The trailing gap after
@@ -828,6 +902,62 @@ mod tests {
             }
             other => panic!("expected Shrink/Wrap, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shrink_fit_picks_largest_fs_that_fits_segment() {
+        // 10 CJK chars at fs=20 → 200px, cell width 120 forces shrink. Largest
+        // fitting size: ceil to widest fs where 10*fs ≤ 120 → fs ≤ 12.
+        let fs = shrink_fit_for_cell("一".repeat(10).as_str(), 120.0, 80.0, 20, 8, 4);
+        assert_eq!(fs, 12);
+        // Same text in a wider cell stays at the configured `font_size`.
+        let fs = shrink_fit_for_cell("一".repeat(10).as_str(), 220.0, 80.0, 20, 8, 4);
+        assert_eq!(fs, 20);
+    }
+
+    #[test]
+    fn shrink_fit_falls_back_to_min_font_size_when_nothing_fits() {
+        // Text far too wide even at `min_font_size`; helper returns the floor
+        // so the renderer can clip rather than fail.
+        let fs = shrink_fit_for_cell("一".repeat(40).as_str(), 30.0, 80.0, 20, 14, 4);
+        assert_eq!(fs, 14);
+    }
+
+    #[test]
+    fn shrink_fit_decision_uses_largest_fitting_size() {
+        let text = "一".repeat(8);
+        let decision = choose_text_strategy(TextStrategyInput {
+            overflow: progressbar_schema::OverflowMode::ShrinkFit,
+            text: &text,
+            rect_width_px: 100.0,
+            rect_height_px: 60.0,
+            font_size: 20,
+            min_font_size: 10,
+            line_spacing: 4,
+            can_rotate: false,
+        });
+        // 8 chars × 12px = 96 ≤ 100 → 12 is the largest fitting size.
+        assert_eq!(decision, TextStrategyDecision::Shrink { font_size: 12 });
+    }
+
+    #[test]
+    fn uniform_shrink_size_picks_smallest_per_segment_optimum() {
+        // Two segments: a comfortable one and a tight one. Uniform shrink
+        // must drop to the tighter cell's size so both fit.
+        let easy = "短".repeat(4);
+        let tight = "长".repeat(15);
+        let segments = vec![(easy.as_str(), 200.0, 80.0), (tight.as_str(), 200.0, 80.0)];
+        let uniform = uniform_shrink_size_for_segments(segments.into_iter(), 28, 10, 4);
+        // Tight segment: 15*fs ≤ 200 → fs ≤ 13. Easy segment fits at 28.
+        // Uniform = min(13, 28) = 13.
+        assert_eq!(uniform, 13);
+    }
+
+    #[test]
+    fn uniform_shrink_size_with_no_segments_returns_font_size() {
+        let segments: Vec<(&str, f32, f32)> = Vec::new();
+        let uniform = uniform_shrink_size_for_segments(segments.into_iter(), 24, 12, 4);
+        assert_eq!(uniform, 24);
     }
 
     #[test]
