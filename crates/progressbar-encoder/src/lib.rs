@@ -13,6 +13,10 @@ use thiserror::Error;
 pub struct RenderProgress {
     pub completed_frames: u64,
     pub total_frames: u64,
+    /// Frames per second of the rendered output, exposed so observers (such
+    /// as the CLI progress printer) can throttle their updates to a
+    /// per-second cadence regardless of `fps`.
+    pub fps: u32,
 }
 
 #[derive(Debug, Error)]
@@ -97,6 +101,7 @@ where
         on_progress(RenderProgress {
             completed_frames: frame_index + 1,
             total_frames,
+            fps: config.render.fps,
         });
     }
 
@@ -188,6 +193,7 @@ where
         on_progress(RenderProgress {
             completed_frames: frame_index + 1,
             total_frames,
+            fps: config.render.fps,
         });
     }
 
@@ -312,6 +318,7 @@ where
             on_progress(RenderProgress {
                 completed_frames: frame_index + 1,
                 total_frames,
+                fps: config.render.fps,
             });
         }
     }
