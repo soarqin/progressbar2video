@@ -31,6 +31,24 @@ Output profiles:
 - `ffv1-mkv`: FFmpeg-backed mathematically lossless alpha video.
 - `prores4444-mov`: FFmpeg-backed editing intermediate with alpha.
 
+For long overlays, enable the alpha strip mode on `apng`, `ffv1-mkv`, or
+`prores4444-mov` to output only the transparent progress-bar band instead of a
+full-frame canvas:
+
+```toml
+[output]
+format = "prores4444-mov"
+path = "out/progress-strip.mov"
+
+[output.strip]
+enabled = true
+padding_top = 16
+padding_bottom = 16
+```
+
+APNG outputs also write dirty-rectangle animation frames, so unchanged transparent
+or static areas are not repeated in every APNG frame.
+
 Render APNG:
 
 ```powershell
