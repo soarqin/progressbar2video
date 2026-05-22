@@ -18,3 +18,7 @@
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Agents
+/.sisyphus/
+/.omo/
