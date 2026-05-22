@@ -1,6 +1,6 @@
 use crc32fast::Hasher;
 use flate2::{write::ZlibEncoder, Compression};
-use progressbar_core::{frame_count, frame_timestamp_ms, Timeline};
+use progressbar_core::{frame_count, frame_timestamp_ms, Layout, Timeline};
 use progressbar_renderer::{write_png, FrameRenderer, RenderedFrame};
 use progressbar_schema::ProjectConfig;
 use std::fs;
@@ -52,6 +52,25 @@ pub enum EncodeError {
 pub struct FfmpegCommandPlan {
     pub program: PathBuf,
     pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PixelRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl PixelRect {
+    fn full(width: u32, height: u32) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
 }
 
 pub fn render_overlay<F>(
@@ -152,13 +171,17 @@ where
     W: Write,
     F: FnMut(RenderProgress),
 {
+    let strip_rect = output_strip_rect(config, timeline)?;
+    let output_width = strip_rect.map_or(config.render.width, |rect| rect.width);
+    let output_height = strip_rect.map_or(config.render.height, |rect| rect.height);
+
     writer
         .write_all(b"\x89PNG\r\n\x1a\n")
         .map_err(EncodeError::WriteOutput)?;
 
     let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&config.render.width.to_be_bytes());
-    ihdr.extend_from_slice(&config.render.height.to_be_bytes());
+    ihdr.extend_from_slice(&output_width.to_be_bytes());
+    ihdr.extend_from_slice(&output_height.to_be_bytes());
     ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
     write_png_chunk(&mut writer, b"IHDR", &ihdr)?;
 
@@ -168,18 +191,35 @@ where
     write_png_chunk(&mut writer, b"acTL", &actl)?;
 
     let mut sequence_number = 0_u32;
+    let mut previous_frame: Option<RenderedFrame> = None;
     let mut renderer = FrameRenderer::new(config, timeline)
         .map_err(|error| EncodeError::Render(error.to_string()))?;
     for frame_index in 0..total_frames {
         let timestamp_ms = frame_timestamp_ms(frame_index, config.render.fps);
-        let frame = renderer
+        let mut frame = renderer
             .render_frame(timestamp_ms)
             .map_err(|error| EncodeError::Render(error.to_string()))?;
-        let fctl = apng_frame_control(&frame, sequence_number, delay_den);
+        if let Some(rect) = strip_rect {
+            frame = crop_frame(&frame, rect);
+        }
+        let rect = if frame_index == 0 {
+            PixelRect::full(frame.width, frame.height)
+        } else {
+            previous_frame
+                .as_ref()
+                .and_then(|previous| changed_pixel_rect(previous, &frame))
+                .unwrap_or(PixelRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                })
+        };
+        let fctl = apng_frame_control(rect, sequence_number, delay_den);
         sequence_number += 1;
         write_png_chunk(&mut writer, b"fcTL", &fctl)?;
 
-        let compressed = compress_rgba_frame(&frame)?;
+        let compressed = compress_rgba_frame_rect(&frame, rect)?;
         if frame_index == 0 {
             write_png_chunk(&mut writer, b"IDAT", &compressed)?;
         } else {
@@ -195,19 +235,20 @@ where
             total_frames,
             fps: config.render.fps,
         });
+        previous_frame = Some(frame);
     }
 
     write_png_chunk(&mut writer, b"IEND", &[])?;
     Ok(())
 }
 
-fn apng_frame_control(frame: &RenderedFrame, sequence_number: u32, delay_den: u16) -> Vec<u8> {
+fn apng_frame_control(rect: PixelRect, sequence_number: u32, delay_den: u16) -> Vec<u8> {
     let mut data = Vec::with_capacity(26);
     data.extend_from_slice(&sequence_number.to_be_bytes());
-    data.extend_from_slice(&frame.width.to_be_bytes());
-    data.extend_from_slice(&frame.height.to_be_bytes());
-    data.extend_from_slice(&0_u32.to_be_bytes());
-    data.extend_from_slice(&0_u32.to_be_bytes());
+    data.extend_from_slice(&rect.width.to_be_bytes());
+    data.extend_from_slice(&rect.height.to_be_bytes());
+    data.extend_from_slice(&rect.x.to_be_bytes());
+    data.extend_from_slice(&rect.y.to_be_bytes());
     data.extend_from_slice(&1_u16.to_be_bytes());
     data.extend_from_slice(&delay_den.to_be_bytes());
     data.push(0);
@@ -215,12 +256,19 @@ fn apng_frame_control(frame: &RenderedFrame, sequence_number: u32, delay_den: u1
     data
 }
 
-fn compress_rgba_frame(frame: &RenderedFrame) -> Result<Vec<u8>, EncodeError> {
+fn compress_rgba_frame_rect(
+    frame: &RenderedFrame,
+    rect: PixelRect,
+) -> Result<Vec<u8>, EncodeError> {
     let stride = frame.width as usize * 4;
-    let mut filtered = Vec::with_capacity(frame.rgba.len() + frame.height as usize);
-    for row in frame.rgba.chunks_exact(stride) {
+    let rect_stride = rect.width as usize * 4;
+    let mut filtered =
+        Vec::with_capacity(rect_stride * rect.height as usize + rect.height as usize);
+    for y in rect.y..rect.y + rect.height {
+        let start = y as usize * stride + rect.x as usize * 4;
+        let end = start + rect_stride;
         filtered.push(0);
-        filtered.extend_from_slice(row);
+        filtered.extend_from_slice(&frame.rgba[start..end]);
     }
 
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -234,6 +282,20 @@ pub fn ffmpeg_command_plan(
     config: &ProjectConfig,
     total_frames: u64,
 ) -> Result<FfmpegCommandPlan, EncodeError> {
+    ffmpeg_command_plan_for_size(
+        config,
+        total_frames,
+        config.render.width,
+        config.render.height,
+    )
+}
+
+fn ffmpeg_command_plan_for_size(
+    config: &ProjectConfig,
+    total_frames: u64,
+    width: u32,
+    height: u32,
+) -> Result<FfmpegCommandPlan, EncodeError> {
     let program = config
         .output
         .ffmpeg_path
@@ -246,7 +308,7 @@ pub fn ffmpeg_command_plan(
         "-pix_fmt".to_string(),
         "rgba".to_string(),
         "-s".to_string(),
-        format!("{}x{}", config.render.width, config.render.height),
+        format!("{}x{}", width, height),
         "-r".to_string(),
         config.render.fps.to_string(),
         "-i".to_string(),
@@ -291,7 +353,10 @@ where
     if let Some(parent) = config.output.path.parent() {
         fs::create_dir_all(parent).map_err(EncodeError::CreateDir)?;
     }
-    let plan = ffmpeg_command_plan(config, total_frames)?;
+    let strip_rect = output_strip_rect(config, timeline)?;
+    let output_width = strip_rect.map_or(config.render.width, |rect| rect.width);
+    let output_height = strip_rect.map_or(config.render.height, |rect| rect.height);
+    let plan = ffmpeg_command_plan_for_size(config, total_frames, output_width, output_height)?;
     let mut renderer = FrameRenderer::new(config, timeline)
         .map_err(|error| EncodeError::Render(error.to_string()))?;
     let mut child = Command::new(&plan.program)
@@ -309,9 +374,12 @@ where
         let stdin = child.stdin.as_mut().expect("stdin was configured as piped");
         for frame_index in 0..total_frames {
             let timestamp_ms = frame_timestamp_ms(frame_index, config.render.fps);
-            let frame = renderer
+            let mut frame = renderer
                 .render_frame(timestamp_ms)
                 .map_err(|error| EncodeError::Render(error.to_string()))?;
+            if let Some(rect) = strip_rect {
+                frame = crop_frame(&frame, rect);
+            }
             stdin
                 .write_all(&frame.rgba)
                 .map_err(EncodeError::FfmpegStdin)?;
@@ -331,6 +399,92 @@ where
             status: status.to_string(),
         })
     }
+}
+
+fn output_strip_rect(
+    config: &ProjectConfig,
+    timeline: &Timeline,
+) -> Result<Option<PixelRect>, EncodeError> {
+    if !config.output.strip.enabled {
+        return Ok(None);
+    }
+
+    let layout = Layout::calculate(config, timeline)
+        .map_err(|error| EncodeError::Render(error.to_string()))?;
+    let mut top = layout.bar.y;
+    let mut bottom = layout.bar.y + layout.bar.height;
+
+    if config.playback_progress.enabled {
+        let progress_y = layout.bar.y + layout.bar.height / 2.0
+            - config.playback_progress.height as f32 / 2.0
+            + config.playback_progress.offset_y as f32;
+        top = top.min(progress_y - config.playback_progress.thumb_radius as f32);
+        bottom = bottom.max(
+            progress_y
+                + config.playback_progress.height as f32
+                + config.playback_progress.thumb_radius as f32,
+        );
+    }
+
+    top -= config.output.strip.padding_top as f32;
+    bottom += config.output.strip.padding_bottom as f32;
+    let y = top.floor().max(0.0) as u32;
+    let bottom = bottom.ceil().min(config.render.height as f32) as u32;
+    let height = bottom.saturating_sub(y).max(1);
+
+    Ok(Some(PixelRect {
+        x: 0,
+        y,
+        width: config.render.width,
+        height,
+    }))
+}
+
+fn crop_frame(frame: &RenderedFrame, rect: PixelRect) -> RenderedFrame {
+    let source_stride = frame.width as usize * 4;
+    let output_stride = rect.width as usize * 4;
+    let mut rgba = Vec::with_capacity(output_stride * rect.height as usize);
+    for y in rect.y..rect.y + rect.height {
+        let start = y as usize * source_stride + rect.x as usize * 4;
+        rgba.extend_from_slice(&frame.rgba[start..start + output_stride]);
+    }
+
+    RenderedFrame {
+        width: rect.width,
+        height: rect.height,
+        rgba,
+    }
+}
+
+fn changed_pixel_rect(previous: &RenderedFrame, current: &RenderedFrame) -> Option<PixelRect> {
+    debug_assert_eq!(previous.width, current.width);
+    debug_assert_eq!(previous.height, current.height);
+
+    let mut min_x = current.width;
+    let mut min_y = current.height;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    let mut changed = false;
+
+    for y in 0..current.height {
+        for x in 0..current.width {
+            let index = ((y * current.width + x) * 4) as usize;
+            if previous.rgba[index..index + 4] != current.rgba[index..index + 4] {
+                changed = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+
+    changed.then_some(PixelRect {
+        x: min_x,
+        y: min_y,
+        width: max_x - min_x + 1,
+        height: max_y - min_y + 1,
+    })
 }
 
 fn write_png_chunk<W: Write>(
@@ -374,6 +528,24 @@ mod tests {
             offset += 12 + length;
         }
         names
+    }
+
+    fn png_chunks(bytes: &[u8], chunk_name: &[u8; 4]) -> Vec<Vec<u8>> {
+        let mut chunks = Vec::new();
+        let mut offset = 8;
+        while offset + 12 <= bytes.len() {
+            let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            let name = &bytes[offset + 4..offset + 8];
+            if name == chunk_name {
+                chunks.push(bytes[offset + 8..offset + 8 + length].to_vec());
+            }
+            offset += 12 + length;
+        }
+        chunks
+    }
+
+    fn chunk_u32(data: &[u8], offset: usize) -> u32 {
+        u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap())
     }
 
     #[test]
@@ -425,6 +597,38 @@ mod tests {
     }
 
     #[test]
+    fn strip_apng_uses_cropped_canvas_and_dirty_rect_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ProjectConfig::default();
+        config.render.width = 96;
+        config.render.height = 54;
+        config.render.fps = 2;
+        config.bar.margin_x = 8;
+        config.bar.margin_bottom = 6;
+        config.bar.height = 16;
+        config.output.format = progressbar_schema::OutputFormat::Apng;
+        config.output.path = dir.path().join("progress.apng");
+        config.output.strip.enabled = true;
+        config.output.strip.padding_top = 2;
+        config.output.strip.padding_bottom = 3;
+        let timeline = Timeline::parse("1 | A").unwrap();
+
+        render_apng(&config, &timeline, |_| {}).unwrap();
+
+        let bytes = std::fs::read(&config.output.path).unwrap();
+        let ihdr = png_chunks(&bytes, b"IHDR").remove(0);
+        assert_eq!(chunk_u32(&ihdr, 0), 96);
+        assert!(chunk_u32(&ihdr, 4) < 54);
+
+        let controls = png_chunks(&bytes, b"fcTL");
+        assert_eq!(chunk_u32(&controls[0], 4), 96);
+        assert_eq!(chunk_u32(&controls[0], 8), chunk_u32(&ihdr, 4));
+        assert!(
+            chunk_u32(&controls[1], 4) < 96 || chunk_u32(&controls[1], 8) < chunk_u32(&ihdr, 4)
+        );
+    }
+
+    #[test]
     fn builds_ffv1_command_with_alpha_pixel_format() {
         let mut config = ProjectConfig::default();
         config.render.width = 320;
@@ -454,6 +658,18 @@ mod tests {
         assert!(plan.args.contains(&"4444".to_string()));
         assert!(plan.args.contains(&"yuva444p10le".to_string()));
         assert_eq!(plan.args.last().unwrap(), "out/progress.mov");
+    }
+
+    #[test]
+    fn builds_ffmpeg_command_for_strip_dimensions() {
+        let mut config = ProjectConfig::default();
+        config.output.format = progressbar_schema::OutputFormat::Ffv1Mkv;
+        config.output.path = PathBuf::from("out/progress.mkv");
+
+        let plan = ffmpeg_command_plan_for_size(&config, 12, 320, 80).unwrap();
+
+        let size_index = plan.args.iter().position(|arg| arg == "-s").unwrap();
+        assert_eq!(plan.args[size_index + 1], "320x80");
     }
 
     #[test]

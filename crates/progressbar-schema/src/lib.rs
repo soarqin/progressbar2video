@@ -165,6 +165,7 @@ pub struct OutputConfig {
     pub format: OutputFormat,
     pub path: PathBuf,
     pub ffmpeg_path: Option<PathBuf>,
+    pub strip: OutputStripConfig,
 }
 
 impl Default for OutputConfig {
@@ -173,6 +174,25 @@ impl Default for OutputConfig {
             format: OutputFormat::PngSequence,
             path: PathBuf::from("out/progress"),
             ffmpeg_path: None,
+            strip: OutputStripConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(default)]
+pub struct OutputStripConfig {
+    pub enabled: bool,
+    pub padding_top: u32,
+    pub padding_bottom: u32,
+}
+
+impl Default for OutputStripConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            padding_top: 16,
+            padding_bottom: 16,
         }
     }
 }
@@ -399,5 +419,26 @@ path = "out/progress.mov"
         )
         .unwrap();
         assert_eq!(prores.output.format, OutputFormat::Prores4444Mov);
+    }
+
+    #[test]
+    fn parses_overlay_strip_config() {
+        let config = ProjectConfig::from_toml_str(
+            r#"
+[output]
+format = "apng"
+path = "out/progress.apng"
+
+[output.strip]
+enabled = true
+padding_top = 8
+padding_bottom = 12
+"#,
+        )
+        .unwrap();
+
+        assert!(config.output.strip.enabled);
+        assert_eq!(config.output.strip.padding_top, 8);
+        assert_eq!(config.output.strip.padding_bottom, 12);
     }
 }
