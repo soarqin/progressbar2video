@@ -187,7 +187,7 @@ where
 
     let mut actl = Vec::with_capacity(8);
     actl.extend_from_slice(&total_frames_u32.to_be_bytes());
-    actl.extend_from_slice(&0_u32.to_be_bytes());
+    actl.extend_from_slice(&1_u32.to_be_bytes());
     write_png_chunk(&mut writer, b"acTL", &actl)?;
 
     let mut sequence_number = 0_u32;
@@ -548,6 +548,10 @@ mod tests {
         u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap())
     }
 
+    fn chunk_u16(data: &[u8], offset: usize) -> u16 {
+        u16::from_be_bytes(data[offset..offset + 2].try_into().unwrap())
+    }
+
     #[test]
     fn writes_frame_count_from_duration_and_fps() {
         let dir = tempfile::tempdir().unwrap();
@@ -594,6 +598,35 @@ mod tests {
         assert!(chunks.contains(&"fdAT".to_string()));
         assert_eq!(seen.last().unwrap().completed_frames, 2);
         assert_eq!(seen.last().unwrap().total_frames, 2);
+    }
+
+    #[test]
+    fn apng_declares_finite_duration_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ProjectConfig::default();
+        config.render.width = 96;
+        config.render.height = 54;
+        config.render.fps = 10;
+        config.bar.margin_x = 8;
+        config.bar.margin_bottom = 6;
+        config.bar.height = 16;
+        config.output.format = progressbar_schema::OutputFormat::Apng;
+        config.output.path = dir.path().join("progress.apng");
+        let timeline = Timeline::parse("2 | A").unwrap();
+
+        render_apng(&config, &timeline, |_| {}).unwrap();
+
+        let bytes = std::fs::read(&config.output.path).unwrap();
+        let actl = png_chunks(&bytes, b"acTL").remove(0);
+        assert_eq!(chunk_u32(&actl, 0), 20);
+        assert_eq!(chunk_u32(&actl, 4), 1);
+
+        let controls = png_chunks(&bytes, b"fcTL");
+        assert_eq!(controls.len(), 20);
+        for control in controls {
+            assert_eq!(chunk_u16(&control, 20), 1);
+            assert_eq!(chunk_u16(&control, 22), 10);
+        }
     }
 
     #[test]
